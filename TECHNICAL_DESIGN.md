@@ -1,7 +1,7 @@
 # PDF Score → MusicXML: Technical Design
 
 > 작성일: 2026-04-22  
-> v2: 외부 OMR 의존성 제거, 자체 파이프라인으로 전환
+> v3: 리뷰 반영 — 좌표계 수정, Pass 2b 호출 방식, 이조 변환, Rule 6, 스프린트 순서
 
 ---
 
@@ -72,27 +72,29 @@ Pass 2a, 2b는 병렬 실행 가능 (독립적).
 
 ### 두 단계로 나눔
 
-**Step 1-A: 악기 목록 + 파트 레이아웃**
-첫 페이지에만 실행. 악기명, 파트 수, 각 파트의 y 위치 비율을 읽는다.
+**Step 1-A: 악기 목록 + 파트 순서**
+첫 페이지에만 실행. 악기명과 위에서 아래 순서만 읽는다.  
+y 좌표는 읽지 않는다 — 페이지마다 쉬는 악기 파트가 생략되거나 보표 간격이 달라지므로 절대/비율 좌표는 신뢰할 수 없다.
 
 ```
 프롬프트:
 "이 악보의 첫 페이지야.
 왼쪽 끝에 적힌 악기 이름을 모두 읽어줘.
-위에서 아래 순서대로, 각 악기의 보표가 전체 높이에서 몇 % 위치에 있는지도 알려줘.
+위에서 아래 순서대로만 나열해.
 
 JSON:
 {
   'parts': [
-    {'name': 'Piccolo', 'y_ratio': 0.08},
-    {'name': 'Flute', 'y_ratio': 0.13},
+    {'id': 'P1', 'name': 'Piccolo', 'order': 0},
+    {'id': 'P2', 'name': 'Flute', 'order': 1},
     ...
   ]
 }"
 ```
 
 **Step 1-B: 페이지별 시스템 구조**
-모든 페이지에 실행. 음표/코드는 읽지 않음.
+모든 페이지에 실행. 음표/코드는 읽지 않음.  
+y 좌표는 시스템 단위(가로 줄 전체)만 받는다 — 악기별 내부 위치는 "시스템 안에서 위에서 N번째 파트"로 처리한다.
 
 ```
 프롬프트:
@@ -102,15 +104,24 @@ JSON:
 2. 각 시스템의 첫 마디 번호 (시스템 왼쪽 끝에 인쇄된 숫자)
 3. 조표 변화: 몇 번 마디에서 변하는지, 바뀐 조성 (Concert pitch 기준)
 4. 박자표 변화 (있으면)
+5. 각 시스템에 포함된 악기 목록 (이 시스템에서 쉬어서 생략된 파트가 있으면 제외)
 
 JSON:
 {
   'systems': [
-    {'start_measure': 1, 'key': 'G major', 'time': '4/4', 'y_top': 0.12, 'y_bottom': 0.45},
-    {'start_measure': 26, 'key': 'G major', 'time': '4/4', 'y_top': 0.50, 'y_bottom': 0.85}
+    {
+      'start_measure': 1,
+      'key': 'G major',
+      'time': '4/4',
+      'y_top_px': 120,
+      'y_bottom_px': 450,
+      'active_parts': ['P1','P2','P3',...,'P25']
+    }
   ]
 }"
 ```
+
+y 좌표는 픽셀 절대값으로 받는다. 비율은 페이지 크기가 바뀌면 쓸 수 없다.
 
 ### 출력 — ScoreLayout
 
@@ -119,9 +130,19 @@ JSON:
 class PartInfo:
     id: str                  # "P1", "P2" 등
     name: str                # "Piccolo", "Piano" 등
-    y_ratio: float           # 전체 페이지 높이 대비 위치 (0.0~1.0)
+    order: int               # 위에서 아래 순서 (0-based)
     clef: str                # "treble", "bass", "alto", "tenor"
-    transposition: int       # concert pitch 대비 반음 수 (Bb클라리넷: -2)
+    transposition_semitones: int  # written→concert pitch 반음 수. 코드로 처리, Claude 미사용
+                                  # Bb악기: -2, F악기: -7, Eb악기: -9, Concert: 0
+
+# 이조악기 테이블 (결정론적, Claude에게 맡기지 않음)
+TRANSPOSITION_TABLE = {
+    "Clarinet in Bb": -2, "Trumpet in Bb": -2,
+    "Horn in F": -7,
+    "Clarinet in Eb": 3,
+    "Piccolo": 12,
+    "Contrabass": -12,
+}
 
 @dataclass
 class SystemInfo:
@@ -129,10 +150,11 @@ class SystemInfo:
     system_index: int
     start_measure: int
     end_measure: int         # 다음 시스템 start - 1
-    key: str                 # "G major", "Ab minor" 등
-    time_signature: str      # "4/4", "3/8" 등
-    y_top: float
-    y_bottom: float
+    key: str                 # concert pitch 기준 "G major", "Ab minor"
+    time_signature: str      # "4/4", "3/8"
+    y_top_px: int            # 픽셀 절대값
+    y_bottom_px: int
+    active_parts: list[str]  # 이 시스템에 실제 보표가 있는 파트 id 목록
 
 @dataclass
 class ScoreLayout:
@@ -154,13 +176,21 @@ class ScoreLayout:
 Piano 파트 위의 코드 심볼을 정확하게 추출한다.
 
 ### 크로핑 전략
-Pass 1에서 Piano 파트의 y_ratio를 알고 있음 → Piano staff + 위 여백(코드 심볼 영역)만 crop.
+Pass 1에서 시스템의 `y_top_px`, `y_bottom_px`를 알고 있고, Piano가 시스템 내 몇 번째 파트인지도 안다.  
+시스템 높이를 `active_parts` 수로 균등 분할해서 Piano 위치를 추정한다.
 
+```python
+def crop_piano(page_img, system: SystemInfo, part_order: int) -> Image:
+    system_h = system.y_bottom_px - system.y_top_px
+    n_parts = len(system.active_parts)
+    part_h = system_h / n_parts
+    
+    piano_y_top = system.y_top_px + part_h * part_order - 20   # 코드 심볼 여백 포함
+    piano_y_bot = system.y_top_px + part_h * (part_order + 1) + 5
+    return page_img.crop((0, piano_y_top, page_img.width, piano_y_bot))
 ```
-Piano y_ratio = 0.62 (예시)
-crop: y = [페이지높이 × (0.62 - 0.08), 페이지높이 × (0.62 + 0.05)]
-      x = [전체 너비]
-```
+
+파트가 균등 분할되지 않을 수 있으므로 초기 crop 실패 시 ±10% 여백으로 재시도.
 
 ### 프롬프트
 
@@ -201,6 +231,9 @@ class RawChord:
 각 악기 파트의 음표를 추출한다.  
 이 단계가 외부 OMR을 완전히 대체한다.
 
+### ⚠️ Sprint 2 시작 전 스파이크 필수
+Pass 2b는 아직 정확도 데이터가 없다. Sprint 1 완료 후, Piano 1마디로 스파이크를 먼저 실행하고 정확도 60% 이상일 때만 Sprint 2 진행.
+
 ### 난이도 현실 인식
 
 음표 추출은 코드 심볼보다 훨씬 어렵다.
@@ -226,45 +259,53 @@ Tier 3:       관악 (Flute, Oboe, Clarinet, Bassoon)
 Tier 4:       금관 + 타악
 ```
 
-실사용자 입장에서 Piano + Melody가 있으면 일단 쓸 수 있음.
+실사용자 입장에서 Piano + Melody가 있으면 일단 쓸 수 있음.  
+→ **Sprint 1 완료 후 CEO에게 확인 필요: "Tier 1만으로 쓸 수 있나요?"**
+
+### API 호출 방식
+
+악기별 개별 호출은 너무 많다 (25악기 × 16시스템 = 400 calls).  
+**시스템 단위로 Tier 묶어서 호출한다:**
+
+```
+호출 1: 이 시스템의 Piano treble + bass (2 파트 동시)
+호출 2: 이 시스템의 Melody 파트 (1 파트)
+---
+Tier 1 기준: 16시스템 × 2 calls = 32 calls (전곡 기준)
+```
 
 ### 크로핑
 
-Pass 1의 y_ratio를 사용해서 악기별로 개별 crop.
-
-```
-Violin I y_ratio = 0.78
-crop: y = [페이지높이 × 0.76, 페이지높이 × 0.82]
-```
+Pass 2a와 동일한 방식 (시스템 y_top/y_bottom + 파트 순서로 균등 분할).
 
 ### 프롬프트
 
 ```
-이 이미지는 {instrument} 파트의 마디 {start}~{end}야.
-클레프: {clef}, 조성: {key} (Concert pitch: {concert_key}), 박자: {time_sig}
-이조악기인 경우 표기음과 concert pitch의 차이: {transposition}반음
+이 이미지는 마디 {start}~{end}에 해당하는 악보야.
+{instruments} 파트들의 음표를 추출해줘.
 
-이 파트의 모든 음표를 추출해줘.
-쉼표도 포함. 붙임줄(tie)로 연결된 음표는 tie: true로 표시.
+조성: {key} (concert pitch 기준), 박자: {time_sig}
+클레프: {clef_map}  (예: "Piano treble: treble, Piano bass: bass")
+
+중요: 음표는 악보에 적힌 그대로의 음이름(written pitch)으로 출력해.
+이조 변환은 하지 않아도 돼.
+
+쉼표 포함. 붙임줄(tie)은 tie_start/tie_end로 표시.
 
 JSON:
-[
-  {
-    "measure": 1,
-    "beat": 1.0,
-    "pitch": "G4",        // concert pitch 기준, 쉼표는 "rest"
-    "duration": "quarter",
-    "dots": 0,
-    "tie_start": false,
-    "tie_end": false,
-    "voice": 1,
-    "confidence": 0.9
-  }
-]
+{
+  "Piano treble": [
+    {"measure": 1, "beat": 1.0, "pitch": "G4", "duration": "quarter",
+     "dots": 0, "tie_start": false, "tie_end": false, "voice": 1, "confidence": 0.9}
+  ],
+  "Piano bass": [...]
+}
 
 duration 종류: whole, half, quarter, eighth, 16th, 32nd
-읽기 어려운 경우 confidence 낮게.
+읽기 어려우면 confidence 낮게.
 ```
+
+이조 변환은 파이프라인 코드에서 `TRANSPOSITION_TABLE`로 처리한다.
 
 ### 출력
 
@@ -335,11 +376,11 @@ def classify_chord(chord: ChordSymbol, key: str) -> str:
 범위를 벗어난 음 → confidence 하향 + 플래그
 ```
 
-**Rule 6 — 음표-코드 일관성**
+**Rule 6 — 음표-코드 일관성 (Sprint 4 이후)**
 ```
-각 마디의 코드와 그 마디 멜로디 음들이 코드 톤을 포함하는가?
-멜로디가 코드 톤을 전혀 포함 안 하면 → 둘 중 하나가 틀릴 가능성
-(강박 음이 코드 톤이 아닌 경우 플래그)
+비화성음(passing tone, suspension 등)이 일반적이어서 오탐 비율이 높음.
+MVP에서는 구현하지 않는다.
+향후: 강박(beat 1)의 melody 음이 코드 구성음에 전혀 없을 때만 플래그.
 ```
 
 ### 출력 — ValidatedScore
@@ -401,7 +442,7 @@ class MusicXMLBuilder:
         notes = score.notes.get(part.id, [])
         chords = score.chords if part.name == "Piano" else []
         # 마디별로 <measure> 생성
-        # needs_review=True인 항목은 <notations><technical><footnote> 태그로 마킹
+        # needs_review=True인 항목은 XML 주석으로 마킹 (<!-- REVIEW: ... -->)
 
     def _validate_schema(self, root):
         # musicxml 4.0 xsd로 lxml 검증
@@ -480,36 +521,41 @@ class ScoreDocument:
 
 ### Sprint 1 — Pass 1 + Pass 2a (코드 파이프라인)
 1. 300dpi 렌더링
-2. Pass 1 (구조 분석) 구현 + ScoreLayout 검증
-3. Piano crop + Pass 2a (코드 추출)
+2. Pass 1 구현 + ScoreLayout 검증 (마디번호, 조성, 픽셀 좌표)
+3. Piano crop + Pass 2a (코드 추출, 컨텍스트 주입)
 4. 정확도 재측정 목표: 코드 85%+
+5. **[스파이크] Pass 2b 예비 테스트 — Piano 1마디 음표 추출 정확도 측정**
+6. **[CEO 검증] "코드 심볼만 있는 MusicXML이면 쓸 수 있나요?"**  
+   → Yes: Sprint 2 진행 / No 또는 Tier 1으로 충분: 방향 재검토
 
-### Sprint 2 — Pass 2b (음표 추출, Tier 1)
-1. Piano treble/bass 음표 추출
+### Sprint 2 — Pass 2b (음표 추출, Tier 1) — 스파이크 통과 시
+1. Piano treble/bass 음표 추출 (시스템 단위 그룹 호출)
 2. Melody 파트 1개 음표 추출
-3. Pass 3-B (duration 합산, 피치 범위 검사) 구현
+3. 이조 변환 파이프라인 코드 구현 (TRANSPOSITION_TABLE 기반)
+4. Pass 3-B (duration 합산 검증, 피치 범위 검사) 구현
 
-### Sprint 3 — Pass 3 완성 + MusicXML 빌더
+### Sprint 3 — Pass 3-A 완성 + MusicXML 빌더
 1. Pass 3-A (코드 이론 검증) 완성
-2. Rule 6 (음표-코드 일관성) 구현
-3. MusicXML 빌더 + 스키마 검증
+2. MusicXML 빌더 + lxml 스키마 검증
+3. needs_review XML 주석 마킹
 
-### Sprint 4 — 검수 UI + 실전 테스트
-1. 검수 UI (needs_review 항목 + 원본 PDF)
-2. CEO와 실전 테스트
+### Sprint 4 — 검수 UI + Tier 2 + Rule 6
+1. 검수 UI (needs_review 항목 + 원본 PDF 나란히)
+2. CEO와 실전 테스트 (전곡 end-to-end)
 3. Tier 2 악기 (현악) 추가
+4. Rule 6 (음표-코드 일관성, 강박 기준) 구현
 
 ---
 
 ## 12. 오픈 퀘스천
 
-| # | 질문 | 영향 |
-|---|------|------|
-| 1 | Pass 1 y_ratio가 페이지마다 안정적으로 나오는가? | crop 정확도 |
-| 2 | 음표 추출에서 이조악기(Bb클라리넷 등) concert pitch 변환을 Claude에게 맡길 것인가, 파이프라인에서 처리할 것인가? | Pass 2b 설계 |
-| 3 | 음표-코드 일관성 Rule 6이 실제로 오류를 잡아내는가? | Pass 3 비용 vs 효과 |
-| 4 | Tier 1만으로 CEO가 실제로 쓸 수 있는 파일이 나오는가? | Sprint 우선순위 |
-| 5 | 2차 Claude 호출 (Rule 3 재평가) 비용이 허용 가능한가? | 과금 구조 |
+| # | 질문 | 영향 | 해결 시점 |
+|---|------|------|---------|
+| 1 | 균등 분할 crop이 실제로 파트 위치를 잡아내는가? | Pass 2a/2b crop 정확도 | Sprint 1 |
+| 2 | Pass 2b 스파이크: 음표 추출 정확도 60% 달성 가능한가? | Sprint 2 진행 여부 | Sprint 1 말 |
+| 3 | Tier 1만으로 CEO가 실제로 쓸 수 있는 파일이 나오는가? | Sprint 2 이후 방향 | Sprint 1 말 CEO 검증 |
+| 4 | 2차 Claude 호출 (Rule 3 재평가) 비용이 허용 가능한가? | 과금 구조 | Sprint 3 |
+| 5 | 시스템 단위 그룹 호출이 개별 호출보다 정확도가 낮아지는가? | Pass 2b 호출 방식 | Sprint 2 |
 
 ---
 
