@@ -1,36 +1,24 @@
 # PDF Score → MusicXML: Technical Design
 
 > 작성일: 2026-04-22  
-> 스파이크 결과 기반 설계 (바람의노래 풀스코어 테스트)
+> v2: 외부 OMR 의존성 제거, 자체 파이프라인으로 전환
 
 ---
 
-## 1. 설계 배경
+## 1. 설계 원칙
 
-### 스파이크에서 확인한 것
+외부 OMR 엔진(Audiveris, ChatGPT Plugin 등)에 의존하지 않는다.  
+구조 추출부터 MusicXML 생성까지 전 단계를 우리가 소유한다.
 
-| 도구 | 마디 구조 | 코드 심볼 | 비고 |
-|------|----------|----------|------|
-| ACE Studio | 완전 붕괴 (133→1138) | 0% | 사용 불가 |
-| ChatGPT Plugin | 정확 (133마디, 악기명 일치) | 0% | 구조만 가능 |
-| Claude 단독 (Page 1) | — | 95% (코드값 기준 100%) | 마디번호 shift 문제 |
-| Claude 단독 (Page 4-6) | — | 0% (shift + 조성 미감지) | 밀도 높은 페이지 실패 |
+**왜?**
+- OMR 엔진은 코드 심볼을 전혀 못 읽음 (스파이크에서 확인, 0%)
+- 구조 정확도도 도구마다 편차가 크고 제어 불가능
+- 장기적으로 품질 개선 루프를 우리가 돌려야 함
 
-### 핵심 발견
-
-1. **코드 자체는 잘 읽힌다** — 마디번호 없이 코드값만 비교하면 Page 1-3은 70-100%
-2. **마디번호 shift가 최대 적** — 오인식의 44%가 번호 밀림. 코드 자체는 맞음
-3. **조성 컨텍스트 없이 읽으면 조성 변화 구간에서 붕괴** (Page 6: 10%)
-4. **기존 도구는 Pass 3 (음악 이론 검증)을 전혀 하지 않음** — 차별점
-
-### 문제 분리
-
-```
-구조 레이어 (geometric)   : 마디번호, 조표, 박자표, 시스템 위치 → 명시적으로 인쇄됨
-내용 레이어 (semantic)    : 코드 심볼, 가사, 표현기호 → 컨텍스트가 있어야 정확
-```
-
-단일 패스로 두 레이어를 동시에 처리하면 항상 실패한다.
+**핵심 발견 (스파이크 기반)**
+- Claude 멀티모달은 코드값 자체는 잘 읽음 (Page 1: 100%)
+- 실패 원인의 44%는 마디번호 shift → 구조를 먼저 잡으면 해결 가능
+- 조성 컨텍스트를 주입하면 조성 변화 구간 오인식 제거 가능
 
 ---
 
@@ -39,191 +27,322 @@
 ```
 PDF
  │
- ▼ [Render] 페이지별 고해상도 이미지 (300dpi)
+ ▼ [Render]
+ │   300dpi PNG, 페이지별
  │
- ▼ [Pass 1] 구조 추출 (per page)
- │   ─ 시스템 경계 (y좌표)
- │   ─ 각 시스템의 시작 마디번호
- │   ─ 조표 변화 위치 + 조성 (Concert pitch 기준)
- │   ─ 박자표
- │   → ScoreStructure
+ ▼ [Pass 1] 구조 분석  ────────────────── per page
+ │   악기 목록, 시스템 레이아웃
+ │   마디번호 앵커, 조표/박자표
+ │   → ScoreLayout
  │
- ▼ [Pass 2] 코드 추출 (per system, 컨텍스트 주입)
- │   ─ 시스템 crop 이미지 + "마디 N, 키 X" 프롬프트
- │   ─ 코드명 + beat position + confidence score
- │   → RawChordList
+ ├─▶ [Pass 2a] 코드 심볼 추출  ─────────── per system
+ │     Piano 영역 crop + 구조 컨텍스트 주입
+ │     코드명, beat position, confidence
+ │     → RawChordList
+ │
+ ├─▶ [Pass 2b] 음표 추출  ───────────────── per instrument × per system
+ │     악기별 파트 crop + 클레프/조표/박자 컨텍스트
+ │     pitch, duration, voice, articulation
+ │     → RawNoteList
  │
  ▼ [Pass 3] 음악 이론 검증
- │   ─ 키에서 벗어난 코드 분류 (diatonic / borrowed / out-of-key)
- │   ─ voice leading 도약 검사
- │   ─ 앞뒤 컨텍스트로 모호한 코드 재평가
- │   → ValidatedChordList (with confidence + flags)
+ │   코드: 다이아토닉 분류, 도약 검사, 저신뢰도 재평가
+ │   음표: 마디 내 총 duration 합산 검증, 피치 범위 검사
+ │   → ValidatedScore
  │
- ▼ [Merge] OMR 구조 + 검증된 코드 병합
- │   ─ ChatGPT Plugin / Audiveris 구조 MusicXML 사용
- │   ─ 코드 심볼 삽입
+ ▼ [Build] MusicXML 생성
+ │   ScoreLayout + ValidatedScore → MusicXML 4.0
+ │   스키마 검증
  │   → Draft MusicXML
  │
  ▼ [Review UI]
- │   ─ low confidence 항목만 표시
- │   ─ 원본 PDF 나란히 제공
- │   → Human-corrected MusicXML
- │
- ▼ MusicXML 4.0 스키마 검증 → Export
+ │   needs_review 항목만 표시
+ │   원본 PDF 나란히
+ │   → Final MusicXML
 ```
+
+Pass 2a, 2b는 병렬 실행 가능 (독립적).
 
 ---
 
-## 3. Pass 1 — 구조 추출
+## 3. Pass 1 — 구조 분석
 
 ### 목적
-마디번호와 조성을 먼저 확정해서 Pass 2의 앵커로 사용한다.
+이후 모든 패스의 좌표 앵커와 음악 컨텍스트를 확정한다.
 
-### 입력
-- 페이지 이미지 (300dpi PNG)
+### 두 단계로 나눔
 
-### 프롬프트 설계
+**Step 1-A: 악기 목록 + 파트 레이아웃**
+첫 페이지에만 실행. 악기명, 파트 수, 각 파트의 y 위치 비율을 읽는다.
 
 ```
-이 악보 이미지에서 구조 정보만 추출해줘. 음표나 코드는 보지 않아도 돼.
+프롬프트:
+"이 악보의 첫 페이지야.
+왼쪽 끝에 적힌 악기 이름을 모두 읽어줘.
+위에서 아래 순서대로, 각 악기의 보표가 전체 높이에서 몇 % 위치에 있는지도 알려줘.
 
-1. 시스템(가로 줄) 수
-2. 각 시스템 첫 마디 번호 (시스템 왼쪽 끝 숫자)
-3. 조표 변화: 어느 시스템, 어느 마디에서 조표가 바뀌는지, 바뀐 후 조성
+JSON:
+{
+  'parts': [
+    {'name': 'Piccolo', 'y_ratio': 0.08},
+    {'name': 'Flute', 'y_ratio': 0.13},
+    ...
+  ]
+}"
+```
+
+**Step 1-B: 페이지별 시스템 구조**
+모든 페이지에 실행. 음표/코드는 읽지 않음.
+
+```
+프롬프트:
+"이 악보 페이지에서 구조 정보만 추출해줘. 음표와 코드는 무시해.
+
+1. 시스템 수 (가로 줄 수)
+2. 각 시스템의 첫 마디 번호 (시스템 왼쪽 끝에 인쇄된 숫자)
+3. 조표 변화: 몇 번 마디에서 변하는지, 바뀐 조성 (Concert pitch 기준)
 4. 박자표 변화 (있으면)
 
-JSON으로만 응답:
+JSON:
 {
-  "systems": [
-    {"index": 0, "start_measure": 1, "key": "G major", "time": "4/4"},
-    {"index": 1, "start_measure": 26, "key": "G major", "time": "4/4"}
+  'systems': [
+    {'start_measure': 1, 'key': 'G major', 'time': '4/4', 'y_top': 0.12, 'y_bottom': 0.45},
+    {'start_measure': 26, 'key': 'G major', 'time': '4/4', 'y_top': 0.50, 'y_bottom': 0.85}
   ]
-}
+}"
 ```
 
-### 출력 — ScoreStructure
+### 출력 — ScoreLayout
 
 ```python
 @dataclass
+class PartInfo:
+    id: str                  # "P1", "P2" 등
+    name: str                # "Piccolo", "Piano" 등
+    y_ratio: float           # 전체 페이지 높이 대비 위치 (0.0~1.0)
+    clef: str                # "treble", "bass", "alto", "tenor"
+    transposition: int       # concert pitch 대비 반음 수 (Bb클라리넷: -2)
+
+@dataclass
 class SystemInfo:
-    index: int
+    page: int
+    system_index: int
     start_measure: int
-    end_measure: int        # Pass 2에서 채워짐
-    key: str                # "G major", "F minor" 등 concert pitch
-    time_signature: str     # "4/4"
-    y_top: float            # crop 좌표 (선택)
+    end_measure: int         # 다음 시스템 start - 1
+    key: str                 # "G major", "Ab minor" 등
+    time_signature: str      # "4/4", "3/8" 등
+    y_top: float
     y_bottom: float
 
 @dataclass
-class ScoreStructure:
-    page: int
+class ScoreLayout:
+    parts: list[PartInfo]
     systems: list[SystemInfo]
+    total_measures: int
 ```
 
 ### 실패 처리
-- 마디번호를 못 읽으면 이전 페이지 마지막 번호 + 1 추정
-- 조성을 못 읽으면 이전 시스템 조성 유지
-- 불확실한 경우 `confidence` 필드로 표시, 검수 UI 플래그
+- 마디번호 미인식 → 이전 시스템 끝 + 1로 추정, 플래그
+- 조성 미인식 → 이전 시스템 조성 유지
+- 악기 y위치 불확실 → confidence < 0.8이면 Step 1-A 재실행 (다른 crop으로)
 
 ---
 
-## 4. Pass 2 — 코드 추출
+## 4. Pass 2a — 코드 심볼 추출
 
 ### 목적
-Pass 1의 구조 컨텍스트를 주입해서 정확한 코드 심볼을 추출한다.
-
-### 입력
-- 시스템 단위 crop 이미지
-- "이 줄은 마디 N부터 시작하고, 조성은 X" 컨텍스트
+Piano 파트 위의 코드 심볼을 정확하게 추출한다.
 
 ### 크로핑 전략
-
-**Option A — Claude에게 시스템 경계 물어보기** (구현 쉬움)
-```
-Pass 1에서 y좌표를 받아서 PIL로 crop
-```
-
-**Option B — 악보 구조 기반 고정 crop** (더 빠름)
-```
-풀스코어는 Piano 파트가 항상 중간에 있음
-→ Piano staff + 바로 위 코드 심볼 영역만 crop
-→ 전체 오케스트라 파트를 볼 필요 없음
-```
-
-Option B가 더 빠르고 노이즈가 적다. Piano 파트의 y 위치는 Pass 1에서 한 번만 확인하면 됨.
-
-### 프롬프트 설계
+Pass 1에서 Piano 파트의 y_ratio를 알고 있음 → Piano staff + 위 여백(코드 심볼 영역)만 crop.
 
 ```
-이 악보 이미지는 마디 {start_measure}부터 {end_measure}까지야.
-현재 조성은 {key}이고 박자는 {time_sig}야.
+Piano y_ratio = 0.62 (예시)
+crop: y = [페이지높이 × (0.62 - 0.08), 페이지높이 × (0.62 + 0.05)]
+      x = [전체 너비]
+```
 
-Piano 파트 위에 적힌 코드 심볼을 모두 추출해줘.
-각 코드가 몇 번 마디에 있는지 왼쪽의 숫자를 보고 확인해줘.
+### 프롬프트
 
-JSON으로만 응답:
+```
+이 이미지는 악보의 마디 {start}~{end}에 해당하는 Piano 파트야.
+현재 조성: {key}, 박자: {time_sig}
+
+보표 위에 적힌 코드 심볼을 모두 추출해줘.
+각 코드의 마디 번호는 이미지 왼쪽 숫자를 기준으로 확인해.
+
+JSON:
 [
-  {"measure": 26, "beat": 1, "chord": "G/B", "confidence": 0.95},
-  {"measure": 27, "beat": 1, "chord": "Dsus4", "confidence": 0.90}
+  {"measure": 1, "beat": 1.0, "chord": "G", "confidence": 0.98},
+  {"measure": 2, "beat": 1.0, "chord": "Gmaj7", "confidence": 0.95}
 ]
 
-확신이 낮은 경우 confidence를 낮게 줘 (0.0~1.0).
+읽기 어려운 경우 confidence를 낮게 (< 0.7) 표시해.
 ```
 
-### 출력 — RawChordList
+### 출력
 
 ```python
 @dataclass
 class RawChord:
     measure: int
-    beat: float             # 1.0, 2.0, 2.5 등
-    chord_text: str         # "Gmaj7", "D/F#", "Ebsus4" 등 원문 그대로
-    confidence: float       # 0.0 ~ 1.0
+    beat: float
+    chord_text: str          # 원문 그대로 ("Gmaj7", "D/F#")
+    confidence: float
     source_page: int
     source_system: int
 ```
 
 ---
 
-## 5. Pass 3 — 음악 이론 검증
+## 5. Pass 2b — 음표 추출
 
 ### 목적
-읽은 코드가 음악적으로 말이 되는지 검사해서 오인식을 잡아낸다. 기존 어떤 도구도 이 단계가 없다.
+각 악기 파트의 음표를 추출한다.  
+이 단계가 외부 OMR을 완전히 대체한다.
 
-### 검증 규칙
+### 난이도 현실 인식
 
-#### Rule 1 — 다이아토닉 분류
+음표 추출은 코드 심볼보다 훨씬 어렵다.
+
+| 항목 | 코드 심볼 | 음표 |
+|------|---------|------|
+| 정보 표현 | 텍스트 | 위치(피치) + 형태(길이) |
+| 모호성 | 낮음 | 높음 (임시표, 붙임줄, 점음표) |
+| 컨텍스트 의존 | 조성 | 조성 + 클레프 + 전 마디 상태 |
+| 예상 초기 정확도 | 85%+ | 60-75% (검수 필수) |
+
+→ 음표 추출의 목표는 "완벽"이 아니라 "검수 가능한 초안"
+
+### 악기 우선순위
+
+MVP에서 전체 오케스트라 모든 악기를 완벽하게 읽는 건 비현실적.  
+우선순위를 정한다:
+
 ```
-감지된 키(예: G major) 기준으로 각 코드를 분류:
-- diatonic     : 해당 키의 코드 (G, Am, Bm, C, D, Em, F#dim)
-- borrowed     : 패럴렐 마이너 등에서 빌린 코드 (Eb, Ab/C 등)
-- secondary    : 세컨더리 도미넌트 (A7→D, B7→Em 등)
-- chromatic    : 완전히 벗어남 → confidence 하향 + 플래그
-```
-
-→ chromatic 판정 코드는 "조표 변화 미감지 가능성" 플래그
-
-#### Rule 2 — 근음 도약 검사
-```
-연속 코드의 근음 거리 계산:
-- 반음 0-5: 정상적인 진행
-- 반음 6-7: 흔하지 않음, 낮은 confidence
-- 반음 8+: 매우 드묾 → 마디번호 shift 가능성 플래그
-```
-
-→ 근음이 7도 이상 도약하면 "마디번호가 밀린 것 아닌가?" 의심
-
-#### Rule 3 — 컨텍스트 재평가
-confidence < 0.7 인 코드에 대해:
-```
-"앞 코드는 {prev}, 뒤 코드는 {next}, 키는 {key}야.
-이 이미지의 코드가 '{ambiguous}'로 읽혔는데, 맞나? 
-틀리다면 가장 가능성 있는 코드는?"
+Tier 1 (MVP): Piano (treble + bass), Melody 파트 1개
+Tier 2:       현악 (Violin I, II, Viola, Cello, Bass)
+Tier 3:       관악 (Flute, Oboe, Clarinet, Bassoon)
+Tier 4:       금관 + 타악
 ```
 
-→ 2차 Claude 호출로 재평가, 결과가 다르면 두 후보 모두 검수 UI에 제시
+실사용자 입장에서 Piano + Melody가 있으면 일단 쓸 수 있음.
 
-### 출력 — ValidatedChordList
+### 크로핑
+
+Pass 1의 y_ratio를 사용해서 악기별로 개별 crop.
+
+```
+Violin I y_ratio = 0.78
+crop: y = [페이지높이 × 0.76, 페이지높이 × 0.82]
+```
+
+### 프롬프트
+
+```
+이 이미지는 {instrument} 파트의 마디 {start}~{end}야.
+클레프: {clef}, 조성: {key} (Concert pitch: {concert_key}), 박자: {time_sig}
+이조악기인 경우 표기음과 concert pitch의 차이: {transposition}반음
+
+이 파트의 모든 음표를 추출해줘.
+쉼표도 포함. 붙임줄(tie)로 연결된 음표는 tie: true로 표시.
+
+JSON:
+[
+  {
+    "measure": 1,
+    "beat": 1.0,
+    "pitch": "G4",        // concert pitch 기준, 쉼표는 "rest"
+    "duration": "quarter",
+    "dots": 0,
+    "tie_start": false,
+    "tie_end": false,
+    "voice": 1,
+    "confidence": 0.9
+  }
+]
+
+duration 종류: whole, half, quarter, eighth, 16th, 32nd
+읽기 어려운 경우 confidence 낮게.
+```
+
+### 출력
+
+```python
+@dataclass
+class RawNote:
+    measure: int
+    beat: float
+    pitch: str               # "G4", "F#3", "rest"
+    duration: str            # "quarter", "eighth" 등
+    dots: int                # 0, 1, 2
+    tie_start: bool
+    tie_end: bool
+    voice: int               # 1 or 2
+    confidence: float
+    part_id: str
+    source_system: int
+```
+
+---
+
+## 6. Pass 3 — 음악 이론 검증
+
+### 목적
+Pass 2a, 2b 결과를 음악적 규칙으로 검사해서 오류를 걸러낸다.  
+기존 어떤 도구도 이 단계가 없다 — 우리의 핵심 차별점.
+
+### 3-A: 코드 검증
+
+**Rule 1 — 다이아토닉 분류**
+```python
+def classify_chord(chord: ChordSymbol, key: str) -> str:
+    # 반환: "diatonic" | "borrowed" | "secondary_dominant" | "chromatic"
+    # chromatic → confidence 하향, 조표 변화 가능성 플래그
+```
+
+**Rule 2 — 근음 도약 검사**
+```
+연속 코드 사이 근음 거리 (반음):
+0–5   → 정상
+6–7   → confidence 소폭 하향
+8+    → 마디번호 shift 가능성 플래그 + 재확인 요청
+```
+
+**Rule 3 — 저신뢰도 재평가 (2차 Claude 호출)**
+```
+대상: confidence < 0.7
+프롬프트: "앞 코드 {prev}, 뒤 코드 {next}, 키 {key}. 
+          이 코드가 '{chord}'로 읽혔는데 맞나? 
+          다른 가능성이 있다면?"
+→ 결과가 다르면 두 후보 모두 검수 UI에 제시
+```
+
+### 3-B: 음표 검증
+
+**Rule 4 — 마디 내 duration 합산**
+```
+마디 내 음표 duration 합 ≠ 박자표 × 1마디 분량
+→ 음표 누락/중복 플래그
+예: 4/4인데 5박치 음표가 있으면 즉시 플래그
+```
+
+**Rule 5 — 피치 범위 검사**
+```
+악기별 정상 음역 테이블:
+예) Violin I: G3–A7
+    Piano treble: A0–C8
+범위를 벗어난 음 → confidence 하향 + 플래그
+```
+
+**Rule 6 — 음표-코드 일관성**
+```
+각 마디의 코드와 그 마디 멜로디 음들이 코드 톤을 포함하는가?
+멜로디가 코드 톤을 전혀 포함 안 하면 → 둘 중 하나가 틀릴 가능성
+(강박 음이 코드 톤이 아닌 경우 플래그)
+```
+
+### 출력 — ValidatedScore
 
 ```python
 @dataclass
@@ -231,90 +350,102 @@ class ValidatedChord:
     measure: int
     beat: float
     chord_text: str
-    normalized: ChordSymbol      # 구조화된 코드 객체
+    normalized: ChordSymbol
     confidence: float
-    flags: list[str]             # "chromatic", "large_leap", "low_confidence" 등
-    alternatives: list[str]      # 재평가 후보들
-    needs_review: bool           # True이면 검수 UI에 표시
-```
+    flags: list[str]          # "chromatic", "large_leap", "low_confidence"
+    alternatives: list[str]
+    needs_review: bool
 
-```python
 @dataclass
-class ChordSymbol:
-    root: str           # "G", "F#", "Bb"
-    quality: str        # "major", "minor", "dominant", "major-seventh" 등
-    bass: str | None    # "B", "D#" 등 슬래시 코드
-    extensions: list    # ["add9", "sus4"] 등
+class ValidatedNote:
+    measure: int
+    beat: float
+    pitch: str
+    duration: str
+    dots: int
+    tie_start: bool
+    tie_end: bool
+    voice: int
+    confidence: float
+    flags: list[str]          # "out_of_range", "duration_mismatch"
+    needs_review: bool
+    part_id: str
+
+@dataclass
+class ValidatedScore:
+    layout: ScoreLayout
+    chords: list[ValidatedChord]
+    notes: dict[str, list[ValidatedNote]]   # part_id → notes
+    review_count: int
 ```
 
 ---
 
-## 6. 병합 — OMR 구조 + 코드 심볼
+## 7. MusicXML 빌더
 
-### 전략
-ChatGPT Plugin이 구조(마디수, 악기명)를 정확히 잡는 걸 확인했다.  
-이 MusicXML을 뼈대로 쓰고 코드 심볼만 삽입한다.
+외부 OMR 뼈대 없이 ValidatedScore 전체에서 MusicXML을 직접 생성한다.
+
+### 구조
 
 ```python
-def merge(structure_xml: str, chords: ValidatedChordList) -> str:
-    # structure_xml: ChatGPT plugin 출력 (마디 구조 정확)
-    # chords: Pass 3 통과한 코드 목록
-    
-    # 각 코드를 해당 마디에 <harmony> 태그로 삽입
-    # needs_review=True인 항목은 <harmony> + comment 태그
-    # MusicXML 4.0 스키마 검증
+class MusicXMLBuilder:
+    def build(self, score: ValidatedScore) -> str:
+        root = self._build_header(score.layout)
+        for part in score.layout.parts:
+            part_el = self._build_part(part, score)
+            root.append(part_el)
+        self._validate_schema(root)       # MusicXML 4.0 XSD 검증
+        return ET.tostring(root)
+
+    def _build_part(self, part, score):
+        notes = score.notes.get(part.id, [])
+        chords = score.chords if part.name == "Piano" else []
+        # 마디별로 <measure> 생성
+        # needs_review=True인 항목은 <notations><technical><footnote> 태그로 마킹
+
+    def _validate_schema(self, root):
+        # musicxml 4.0 xsd로 lxml 검증
+        # 실패 시 어느 마디가 문제인지 구체적으로 보고
 ```
 
-### 구조 소스 우선순위
-1. ChatGPT Plugin MusicXML (현재 가장 구조가 좋음)
-2. Audiveris (로컬 실행, 구조 정확도 벤치마크 필요)
-3. 자체 구조 파싱 (장기)
+### 검수 마킹
+`needs_review=True`인 요소는 MusicXML 주석으로 마킹 → 검수 UI에서 하이라이트.
+
+```xml
+<!-- REVIEW: confidence=0.45, flags=chromatic,large_leap -->
+<harmony>
+  <root><root-step>F</root-step></root>
+  <kind>minor</kind>
+</harmony>
+```
 
 ---
 
-## 7. 내부 데이터 모델
+## 8. 데이터 모델 요약
 
 ```python
-# 전체 파이프라인을 흐르는 중간 표현
+# 파이프라인 상태
+class PipelineStatus(Enum):
+    PENDING       = "pending"
+    RENDERING     = "rendering"
+    PASS1_DONE    = "pass1_done"
+    PASS2_DONE    = "pass2_done"
+    PASS3_DONE    = "pass3_done"
+    BUILDING      = "building"
+    REVIEW        = "awaiting_review"
+    DONE          = "done"
+
 @dataclass
 class ScoreDocument:
     id: str
     source_pdf: str
     pages: int
-    status: PipelineStatus      # pending | processing | review | done
-
-@dataclass
-class PipelineResult:
-    document_id: str
-    structure: list[ScoreStructure]     # Pass 1 결과
-    raw_chords: list[RawChord]          # Pass 2 결과
-    validated_chords: list[ValidatedChord]  # Pass 3 결과
-    review_items: list[ValidatedChord]  # needs_review=True만 필터
-    musicxml_draft: str                 # 병합 결과
-
-class PipelineStatus(Enum):
-    PENDING = "pending"
-    PASS1_DONE = "pass1_done"
-    PASS2_DONE = "pass2_done"
-    PASS3_DONE = "pass3_done"
-    AWAITING_REVIEW = "awaiting_review"
-    DONE = "done"
+    status: PipelineStatus
+    layout: ScoreLayout | None
+    validated_score: ValidatedScore | None
+    musicxml_draft: str | None
+    review_count: int          # needs_review 항목 수
 ```
-
----
-
-## 8. 정확도 목표 (수정)
-
-스파이크 결과 기준 현실적 목표:
-
-| Pass | 개선 대상 | 기대 정확도 |
-|------|---------|-----------|
-| Pass 1 (구조) | 마디번호 shift 44% → 0% | 마디번호 95%+ |
-| Pass 2 (컨텍스트 주입) | 조성 오인식 제거 | 코드값 85%+ |
-| Pass 3 (이론 검증) | 잔여 오인식 필터링 | confidence 기반 검수 최소화 |
-| 목표 | 검수 필요 항목 | 전체의 15% 이하 |
-
-검수 UI의 목표: A4 1페이지 기준 플래그 항목 15개 이하, 검수 5분 이내
 
 ---
 
@@ -322,49 +453,63 @@ class PipelineStatus(Enum):
 
 | 역할 | 선택 | 이유 |
 |------|------|------|
-| PDF → 이미지 | `pdftoppm` (poppler) | 설치됨, 300dpi 안정 |
-| 이미지 처리 | `Pillow` | crop, resize |
-| AI 인식 | Claude claude-opus-4-7 (multimodal) | 스파이크에서 코드값 인식 확인 |
-| OMR 구조 | ChatGPT Plugin 또는 Audiveris | 마디 구조 정확성 확인 |
-| MusicXML 파싱/생성 | `music21` 또는 직접 XML | 스키마 검증 포함 |
-| 음악 이론 검증 | 자체 구현 (Python) | 키→스케일→다이아토닉 체크 |
-| 서버 | FastAPI | 비동기 파이프라인 처리 |
+| PDF → 이미지 | `pdftoppm` (poppler) | 300dpi 안정, 설치됨 |
+| 이미지 crop/resize | `Pillow` | 경량 |
+| AI 인식 (Pass 1/2/3) | Claude claude-opus-4-7 multimodal | 스파이크 검증 |
+| MusicXML 생성 | 직접 XML (`lxml`) | 스키마 검증 포함 |
+| 스키마 검증 | MusicXML 4.0 XSD + `lxml` | export 안정성 |
+| 음악 이론 검증 | 자체 구현 Python | 키→스케일→다이아토닉 |
+| 서버 | FastAPI | 비동기 파이프라인 |
 | 프론트엔드 | React | 검수 UI |
 
 ---
 
-## 10. 구현 순서
+## 10. 정확도 목표
 
-### Sprint 1 — Pass 1 + Pass 2 (코어 파이프라인)
-1. PDF → 300dpi 이미지 변환
-2. Pass 1 프롬프트 구현 + ScoreStructure 파싱
-3. 시스템 crop (Piano 영역)
-4. Pass 2 프롬프트 + 컨텍스트 주입
-5. 정확도 재측정 (바람의노래 기준, 목표 85%+)
-
-### Sprint 2 — Pass 3 (이론 검증)
-1. ChordSymbol 파서 (텍스트 → 구조화)
-2. 다이아토닉 분류기
-3. 도약 검사
-4. 저신뢰도 코드 재평가 (2차 Claude 호출)
-
-### Sprint 3 — 병합 + 검수 UI
-1. OMR MusicXML + ValidatedChordList 병합
-2. MusicXML 4.0 스키마 검증
-3. 검수 UI (플래그 항목 리스트 + 원본 PDF 나란히)
-4. CEO와 실전 테스트
+| 항목 | 현재 (단일 패스) | 목표 (3-pass) |
+|------|----------------|--------------|
+| 마디번호 정확도 | ~56% (shift 발생) | 95%+ |
+| 코드 심볼 (컨텍스트 있음) | 95% (Page 1) | 85% 전체 평균 |
+| 음표 (Tier 1: Piano/Melody) | 미측정 | 70%+ |
+| 검수 필요 항목 비율 | — | 전체의 15% 이하 |
+| 검수 시간 목표 | — | A4 1페이지 5분 이내 |
 
 ---
 
-## 11. 오픈 퀘스천
+## 11. 구현 순서
+
+### Sprint 1 — Pass 1 + Pass 2a (코드 파이프라인)
+1. 300dpi 렌더링
+2. Pass 1 (구조 분석) 구현 + ScoreLayout 검증
+3. Piano crop + Pass 2a (코드 추출)
+4. 정확도 재측정 목표: 코드 85%+
+
+### Sprint 2 — Pass 2b (음표 추출, Tier 1)
+1. Piano treble/bass 음표 추출
+2. Melody 파트 1개 음표 추출
+3. Pass 3-B (duration 합산, 피치 범위 검사) 구현
+
+### Sprint 3 — Pass 3 완성 + MusicXML 빌더
+1. Pass 3-A (코드 이론 검증) 완성
+2. Rule 6 (음표-코드 일관성) 구현
+3. MusicXML 빌더 + 스키마 검증
+
+### Sprint 4 — 검수 UI + 실전 테스트
+1. 검수 UI (needs_review 항목 + 원본 PDF)
+2. CEO와 실전 테스트
+3. Tier 2 악기 (현악) 추가
+
+---
+
+## 12. 오픈 퀘스천
 
 | # | 질문 | 영향 |
 |---|------|------|
-| 1 | Pass 1에서 시스템 y좌표를 Claude가 안정적으로 잡아주는가? | crop 전략 결정 |
-| 2 | Piano-only crop vs 전체 시스템 crop 중 어느 쪽이 코드 인식에 더 좋은가? | Pass 2 구현 |
-| 3 | Audiveris가 ChatGPT Plugin보다 구조 정확도가 높은가? | OMR 소스 결정 |
-| 4 | Pass 3 재평가에서 2차 Claude 호출이 실제로 accuracy를 올리는가? | 비용 vs 효과 |
-| 5 | 리드시트 (단일 파트)는 파이프라인이 더 단순해지는가? | MVP 범위 재검토 |
+| 1 | Pass 1 y_ratio가 페이지마다 안정적으로 나오는가? | crop 정확도 |
+| 2 | 음표 추출에서 이조악기(Bb클라리넷 등) concert pitch 변환을 Claude에게 맡길 것인가, 파이프라인에서 처리할 것인가? | Pass 2b 설계 |
+| 3 | 음표-코드 일관성 Rule 6이 실제로 오류를 잡아내는가? | Pass 3 비용 vs 효과 |
+| 4 | Tier 1만으로 CEO가 실제로 쓸 수 있는 파일이 나오는가? | Sprint 우선순위 |
+| 5 | 2차 Claude 호출 (Rule 3 재평가) 비용이 허용 가능한가? | 과금 구조 |
 
 ---
 
