@@ -8,7 +8,7 @@ from PIL import Image
 
 from ..models.score import (
     PartInfo, SystemInfo, ScoreLayout,
-    RehearsalMark, RepeatBarline, VoltaBracket,
+    RehearsalMark, RepeatBarline, VoltaBracket, KeyChange,
     TRANSPOSITION_TABLE,
 )
 from ..utils.json_parser import parse_json_response
@@ -209,6 +209,7 @@ def layout_from_json(path: str | Path) -> ScoreLayout:
             rehearsal_marks=[RehearsalMark(**m) for m in s.get("rehearsal_marks", [])],
             repeat_barlines=[RepeatBarline(**m) for m in s.get("repeat_barlines", [])],
             volta_brackets=[VoltaBracket(**m) for m in s.get("volta_brackets", [])],
+            key_changes=[KeyChange(**m) for m in s.get("key_changes", [])],
         ))
 
     return ScoreLayout(

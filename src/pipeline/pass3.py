@@ -22,10 +22,16 @@ class ValidatedChord:
 
 
 def _get_key_at(measure: int, systems: list[SystemInfo]) -> str:
+    """마디번호에 맞는 키 반환. 시스템 내 key_changes 지원."""
     key = "C major"
     for sys in systems:
         if sys.start_measure <= measure <= sys.end_measure:
-            return sys.key
+            key = sys.key
+            # 시스템 내 키 변화 적용
+            for kc in sorted(sys.key_changes, key=lambda k: k.measure):
+                if measure >= kc.measure:
+                    key = kc.key
+            return key
         if sys.start_measure <= measure:
             key = sys.key
     return key

@@ -42,12 +42,18 @@ class VoltaBracket:
 
 
 @dataclass
+class KeyChange:
+    measure: int
+    key: str    # e.g. "Ab major"
+
+
+@dataclass
 class SystemInfo:
     page: int
     system_index: int
     start_measure: int
     end_measure: int                # 파이프라인에서 계산 (다음 시스템 start - 1)
-    key: str                        # concert pitch 기준 e.g. "G major"
+    key: str                        # concert pitch 기준 e.g. "G major" (시스템 시작 키)
     time_signature: str             # e.g. "4/4"
     y_top_px: int
     y_bottom_px: int
@@ -55,6 +61,7 @@ class SystemInfo:
     rehearsal_marks: list[RehearsalMark] = field(default_factory=list)
     repeat_barlines: list[RepeatBarline] = field(default_factory=list)
     volta_brackets: list[VoltaBracket] = field(default_factory=list)
+    key_changes: list[KeyChange] = field(default_factory=list)  # 시스템 내 키 변화
 
 
 @dataclass
