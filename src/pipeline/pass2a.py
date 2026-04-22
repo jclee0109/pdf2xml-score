@@ -1,9 +1,10 @@
 """Pass 2a: 코드 심볼 추출 — Piano 영역 crop + 구조 컨텍스트 주입"""
 import base64
 import io
+import json
 import logging
+from pathlib import Path
 
-import anthropic
 from PIL import Image
 
 from ..models.score import RawChord, ScoreLayout, SystemInfo
@@ -11,8 +12,12 @@ from ..utils.json_parser import parse_json_response
 from ..utils.render import crop_part_range
 
 log = logging.getLogger(__name__)
-client = anthropic.Anthropic()
 MODEL = "claude-opus-4-7"
+
+
+def _get_client():
+    import anthropic
+    return anthropic.Anthropic()
 
 PIANO_TREBLE_NAMES = {"Piano treble", "Piano"}
 PIANO_BASS_NAMES = {"Piano bass"}
@@ -78,7 +83,7 @@ def extract_chords_for_system(
 
     prompt = _build_prompt(system.start_measure, system.end_measure,
                            system.key, system.time_signature)
-    response = client.messages.create(
+    response = _get_client().messages.create(
         model=MODEL,
         max_tokens=1024,
         messages=[{
@@ -118,6 +123,19 @@ def extract_chords_for_system(
             log.warning(f"Pass 2a: 코드 항목 파싱 오류 {item}: {e}")
 
     return chords
+
+
+def chords_from_json(path: str | Path) -> list[RawChord]:
+    """사전 추출된 JSON 파일에서 RawChord 로드."""
+    data = json.loads(Path(path).read_text())
+    return [
+        RawChord(
+            measure=c["measure"], beat=c["beat"],
+            chord_text=c["chord_text"], confidence=c["confidence"],
+            source_page=c["source_page"], source_system=c["source_system"],
+        )
+        for c in data
+    ]
 
 
 def run_pass2a(page_images: list[Image.Image], layout: ScoreLayout) -> list[RawChord]:

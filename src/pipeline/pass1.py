@@ -1,9 +1,9 @@
 """Pass 1: 구조 분석 — 악기 목록, 시스템 레이아웃, 마디번호, 조표, 반복기호"""
 import base64
+import json
 import logging
 from pathlib import Path
 
-import anthropic
 from PIL import Image
 
 from ..models.score import (
@@ -14,8 +14,12 @@ from ..models.score import (
 from ..utils.json_parser import parse_json_response
 
 log = logging.getLogger(__name__)
-client = anthropic.Anthropic()
 MODEL = "claude-opus-4-7"
+
+
+def _get_client():
+    import anthropic
+    return anthropic.Anthropic()
 
 
 def _image_to_base64(img: Image.Image) -> str:
@@ -26,6 +30,7 @@ def _image_to_base64(img: Image.Image) -> str:
 
 
 def _call_claude(img: Image.Image, prompt: str) -> str:
+    client = _get_client()
     response = client.messages.create(
         model=MODEL,
         max_tokens=2048,
@@ -174,6 +179,45 @@ def _fill_end_measures(all_systems: list[SystemInfo], total_measures: int) -> No
 
 
 # ── 메인 진입점 ────────────────────────────────────────────────────────────────
+
+def layout_from_json(path: str | Path) -> ScoreLayout:
+    """사전 추출된 JSON 파일에서 ScoreLayout 로드."""
+    data = json.loads(Path(path).read_text())
+
+    parts = [
+        PartInfo(
+            id=p["id"], name=p["name"], order=p["order"],
+            clef=p["clef"],
+            transposition_semitones=TRANSPOSITION_TABLE.get(p["name"], 0),
+        )
+        for p in data["parts"]
+    ]
+    name_to_id = {p.name: p.id for p in parts}
+
+    systems = []
+    for s in data["systems"]:
+        systems.append(SystemInfo(
+            page=s["page"],
+            system_index=s["system_index"],
+            start_measure=s["start_measure"],
+            end_measure=s["end_measure"],
+            key=s["key"],
+            time_signature=s.get("time_signature") or s.get("time", "4/4"),
+            y_top_px=s["y_top_px"],
+            y_bottom_px=s["y_bottom_px"],
+            active_parts=s["active_parts"],
+            rehearsal_marks=[RehearsalMark(**m) for m in s.get("rehearsal_marks", [])],
+            repeat_barlines=[RepeatBarline(**m) for m in s.get("repeat_barlines", [])],
+            volta_brackets=[VoltaBracket(**m) for m in s.get("volta_brackets", [])],
+        ))
+
+    return ScoreLayout(
+        parts=parts,
+        systems=systems,
+        total_measures=data["total_measures"],
+        name_to_id=name_to_id,
+    )
+
 
 def run_pass1(page_images: list[Image.Image]) -> ScoreLayout:
     """전체 Pass 1 실행. ScoreLayout 반환."""
