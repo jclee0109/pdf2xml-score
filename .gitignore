@@ -1,0 +1,15 @@
+# 악보 샘플 파일 (내부 자료)
+*.pdf
+*.musicxml
+*.mxl
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# 임시 파일
+*.tmp
+/tmp/
