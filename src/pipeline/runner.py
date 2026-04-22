@@ -6,6 +6,8 @@ from ..models.score import ScoreDocument, PipelineStatus
 from ..utils.render import render_pdf, load_image
 from .pass1 import run_pass1, layout_from_json
 from .pass2a import run_pass2a, chords_from_json
+from .pass3 import validate_chords
+from .build import build_musicxml
 
 log = logging.getLogger(__name__)
 
@@ -66,4 +68,19 @@ def run_sprint1_from_files(output_dir: str | Path) -> ScoreDocument:
     )
     log.info(f"파일 로드 완료: {len(layout.parts)}파트, "
              f"{len(layout.systems)}시스템, {len(chords)}코드")
+
+    # Pass 3
+    validated = validate_chords(doc.raw_chords, doc.layout)
+    doc.status = PipelineStatus.PASS3_DONE
+    doc.review_count = sum(1 for v in validated if v.needs_review)
+
+    # Build
+    doc.status = PipelineStatus.BUILDING
+    xml_bytes = build_musicxml(doc.layout, validated)
+    out_path = output_dir / f"{doc.id}.musicxml"
+    out_path.write_bytes(xml_bytes)
+    doc.musicxml_draft = str(out_path)
+    doc.status = PipelineStatus.AWAITING_REVIEW
+
+    log.info(f"저장: {out_path}")
     return doc
