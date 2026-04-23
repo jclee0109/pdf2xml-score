@@ -3,6 +3,22 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 
+def _transposition_semitones(name: str) -> int:
+    """악기 이름(부분 일치)으로 이조 반음 수 반환. 파트 이름에 '1/2' 등 suffix가 붙어도 매칭."""
+    name_lower = name.lower()
+    if "piccolo" in name_lower:
+        return 12
+    if "clarinet in eb" in name_lower:
+        return 3
+    if "clarinet in bb" in name_lower or "trumpet in bb" in name_lower:
+        return -2
+    if "horn in f" in name_lower:
+        return -7
+    if "contrabass" in name_lower:
+        return -12
+    return 0
+
+
 TRANSPOSITION_TABLE: dict[str, int] = {
     "Clarinet in Bb": -2,
     "Trumpet in Bb": -2,

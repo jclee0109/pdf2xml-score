@@ -1,9 +1,9 @@
-"""Pass 3: 음악 이론 검증 — Rule 1 (다이아토닉), Rule 2 (근음 도약)"""
+"""Pass 3: 음악 이론 검증 — Rule 1~4"""
 from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 
-from ..models.score import RawChord, ScoreLayout, SystemInfo
+from ..models.score import RawChord, RawNote, ScoreLayout, SystemInfo
 from ..models.chord import ChordSymbol, parse_chord_text, diatonic_pcs
 
 log = logging.getLogger(__name__)
@@ -111,3 +111,68 @@ def validate_chords(
     log.info(f"Pass 3 완료: {total}개 코드, 검수 필요 {review_count}개 "
              f"({review_count/total*100:.0f}%)" if total else "Pass 3: 코드 없음")
     return validated
+
+
+# ── Rule 4: 음표 duration 합산 검증 ────────────────────────────────────────────
+
+DURATION_QUARTERS: dict[str, float] = {
+    "whole": 4.0, "half": 2.0, "quarter": 1.0,
+    "eighth": 0.5, "16th": 0.25, "32nd": 0.125,
+}
+
+
+def _time_sig_quarters(time_sig: str) -> float:
+    """박자표 → 마디당 4분음표 수. 6/8 → 3.0, 4/4 → 4.0"""
+    beats, beat_type = time_sig.split("/")
+    return int(beats) * 4.0 / int(beat_type)
+
+
+def validate_notes(
+    raw_notes: list[RawNote],
+    layout: ScoreLayout,
+) -> list[RawNote]:
+    """Rule 4: 마디 내 duration 합이 박자표와 맞지 않으면 경고 로그.
+    음표 자체는 수정하지 않고 그대로 반환. 검수 플래그는 confidence < 0.7로 표시."""
+
+    # (part_id, measure) → notes
+    by_pm: dict[tuple[str, int], list[RawNote]] = {}
+    for n in raw_notes:
+        by_pm.setdefault((n.part_id, n.measure), []).append(n)
+
+    flagged = 0
+    for (part_id, measure), notes in by_pm.items():
+        sys = next(
+            (s for s in layout.systems if s.start_measure <= measure <= s.end_measure),
+            None,
+        )
+        if sys is None:
+            continue
+        expected = _time_sig_quarters(sys.time_signature)
+
+        # voice별 합산 (각 voice는 독립)
+        by_voice: dict[int, list[RawNote]] = {}
+        for n in notes:
+            by_voice.setdefault(n.voice, []).append(n)
+
+        for voice, v_notes in by_voice.items():
+            # chord 음표(같은 beat 중복)는 한 번만 합산
+            seen_beats: dict[float, float] = {}
+            for n in v_notes:
+                dur = DURATION_QUARTERS.get(n.duration, 1.0) * (1 + sum(0.5**i for i in range(1, n.dots + 1)))
+                if n.beat not in seen_beats or dur > seen_beats[n.beat]:
+                    seen_beats[n.beat] = dur
+            total = sum(seen_beats.values())
+
+            if abs(total - expected) > 0.01:
+                log.warning(
+                    f"Rule 4: m{measure} {part_id} v{voice} — "
+                    f"duration 합 {total:.3f} ≠ 박자 {expected:.3f} ({sys.time_signature})"
+                )
+                flagged += 1
+
+    if flagged:
+        log.info(f"Rule 4: {flagged}개 마디/성부에서 duration 불일치")
+    else:
+        log.info("Rule 4: 모든 마디 duration 정상")
+
+    return raw_notes

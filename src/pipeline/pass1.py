@@ -1,5 +1,4 @@
 """Pass 1: 구조 분석 — 악기 목록, 시스템 레이아웃, 마디번호, 조표, 반복기호"""
-import base64
 import json
 import logging
 from pathlib import Path
@@ -9,47 +8,12 @@ from PIL import Image
 from ..models.score import (
     PartInfo, SystemInfo, ScoreLayout,
     RehearsalMark, RepeatBarline, VoltaBracket, KeyChange,
-    TRANSPOSITION_TABLE,
+    TRANSPOSITION_TABLE, _transposition_semitones,
 )
 from ..utils.json_parser import parse_json_response
+from ..utils.llm import call_vision
 
 log = logging.getLogger(__name__)
-MODEL = "claude-opus-4-7"
-
-
-def _get_client():
-    import anthropic
-    return anthropic.Anthropic()
-
-
-def _image_to_base64(img: Image.Image) -> str:
-    import io
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    return base64.standard_b64encode(buf.getvalue()).decode()
-
-
-def _call_claude(img: Image.Image, prompt: str) -> str:
-    client = _get_client()
-    response = client.messages.create(
-        model=MODEL,
-        max_tokens=2048,
-        messages=[{
-            "role": "user",
-            "content": [
-                {
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": "image/png",
-                        "data": _image_to_base64(img),
-                    },
-                },
-                {"type": "text", "text": prompt},
-            ],
-        }],
-    )
-    return response.content[0].text
 
 
 # ── Step 1-A: 악기 목록 ────────────────────────────────────────────────────────
@@ -57,21 +21,24 @@ def _call_claude(img: Image.Image, prompt: str) -> str:
 STEP1A_PROMPT = """이 악보의 첫 페이지야.
 왼쪽 끝에 적힌 악기 이름을 모두 읽어줘.
 위에서 아래 순서대로, 각 악기의 클레프(treble/bass/alto/tenor)도 함께 알려줘.
-Piano처럼 treble + bass 두 단이 있는 악기는 두 줄로 나눠서 표기해.
+Piano, Organ, Harp처럼 treble + bass 두 단이 있는 악기는 두 줄로 나눠서 표기해.
+예: "Piano"이면 "Piano treble"(clef: treble)과 "Piano bass"(clef: bass)로 분리.
+    "Organ"이면 "Organ treble"과 "Organ bass"로 분리.
 
 반드시 JSON만 응답해. 설명 없이:
 {
   "parts": [
-    {"name": "Piccolo",      "order": 0, "clef": "treble"},
-    {"name": "Flute",        "order": 1, "clef": "treble"},
-    {"name": "Piano treble", "order": 14, "clef": "treble"},
-    {"name": "Piano bass",   "order": 15, "clef": "bass"}
+    {"name": "Violin I",     "order": 0, "clef": "treble"},
+    {"name": "Violin II",    "order": 1, "clef": "treble"},
+    {"name": "Viola",        "order": 2, "clef": "alto"},
+    {"name": "Violoncello",  "order": 3, "clef": "bass"},
+    {"name": "Contrabass",   "order": 4, "clef": "bass"}
   ]
 }"""
 
 
 def extract_parts(first_page_img: Image.Image) -> list[PartInfo]:
-    raw = _call_claude(first_page_img, STEP1A_PROMPT)
+    raw = call_vision(first_page_img, STEP1A_PROMPT)
     data = parse_json_response(raw, "step1a")
     if data is None:
         raise RuntimeError("Step 1-A: 악기 목록 파싱 실패")
@@ -84,7 +51,7 @@ def extract_parts(first_page_img: Image.Image) -> list[PartInfo]:
             name=name,
             order=p["order"],
             clef=p.get("clef", "treble"),
-            transposition_semitones=TRANSPOSITION_TABLE.get(name, 0),
+            transposition_semitones=_transposition_semitones(name),
         ))
     return parts
 
@@ -96,7 +63,11 @@ STEP1B_PROMPT = """이 악보 페이지에서 구조 정보만 추출해줘. 음
 1. 시스템 수 (가로 줄 수)
 2. 각 시스템의 첫 마디 번호 (시스템 왼쪽 끝에 인쇄된 숫자)
 3. 조표: concert pitch 기준 조성 (예: "G major", "F minor")
-4. 박자표 (변화가 있으면 어느 마디에서 바뀌는지)
+4. 박자표 — 악보에 인쇄된 숫자를 정확히 읽어줘.
+   단순박자 예: "4/4", "3/4", "2/4", "2/2"
+   복합박자 예: "6/8", "9/8", "12/8", "6/4"
+   변박 예: "5/4", "7/8"
+   변화가 있으면 어느 마디에서 바뀌는지도 표시.
 5. 각 시스템에 포함된 악기 이름 목록 (쉬어서 생략된 파트 제외)
 6. 리허설 마크 (박스/원 안 문자, 예: A B C)
 7. 반복 기호 (repeat barline 시작/끝, 볼타 브라켓)
@@ -108,7 +79,7 @@ STEP1B_PROMPT = """이 악보 페이지에서 구조 정보만 추출해줘. 음
     {
       "start_measure": 1,
       "key": "G major",
-      "time": "4/4",
+      "time": "6/8",
       "y_top_px": 120,
       "y_bottom_px": 450,
       "active_parts": ["Piccolo", "Flute", "Piano treble", "Piano bass"],
@@ -122,7 +93,7 @@ STEP1B_PROMPT = """이 악보 페이지에서 구조 정보만 추출해줘. 음
 
 def extract_systems(page_img: Image.Image, page_num: int,
                     name_to_id: dict[str, str]) -> list[SystemInfo]:
-    raw = _call_claude(page_img, STEP1B_PROMPT)
+    raw = call_vision(page_img, STEP1B_PROMPT)
     data = parse_json_response(raw, f"step1b_page{page_num}")
     if data is None:
         log.warning(f"Page {page_num}: 시스템 구조 파싱 실패, 빈 시스템 반환")
