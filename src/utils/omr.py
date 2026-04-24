@@ -127,6 +127,137 @@ def _parse_mxl(mxl_bytes: bytes, start_measure: int, end_measure: int) -> dict:
     return result
 
 
+def _parse_mxl_single(mxl_bytes: bytes, start_measure: int, end_measure: int) -> list[dict]:
+    """단일 보표 oemer MusicXML → note dict list.
+
+    _parse_mxl과 달리 staff 구분 없이 첫 번째 파트 전체를 반환.
+    """
+    root = ET.fromstring(mxl_bytes)
+    notes_out: list[dict] = []
+
+    part = root.find("part")
+    if part is None:
+        return notes_out
+
+    beat_counter = 1.0
+    div = 1
+
+    for oemer_idx, measure in enumerate(part.findall("measure")):
+        real_measure = start_measure + oemer_idx
+        if real_measure > end_measure:
+            break
+
+        beat_counter = 1.0
+
+        for child in measure:
+            if child.tag == "attributes":
+                div_el = child.find("divisions")
+                if div_el is not None:
+                    try:
+                        div = int(div_el.text)
+                    except (ValueError, TypeError):
+                        pass
+            elif child.tag == "note":
+                note = child
+                pitch_el = note.find("pitch")
+                type_el  = note.find("type")
+                dots     = len(note.findall("dot"))
+                voice_el = note.find("voice")
+                chord_el = note.find("chord")
+                tie_els  = note.findall("tie")
+                dur_el   = note.find("duration")
+
+                voice     = int(voice_el.text) if voice_el is not None else 1
+                dur_ticks = int(dur_el.text)   if dur_el   is not None else div
+
+                if chord_el is None:
+                    beat_val = beat_counter
+                    beat_counter += dur_ticks / div
+                else:
+                    beat_val = beat_counter - dur_ticks / div
+
+                if pitch_el is not None:
+                    step = pitch_el.find("step").text
+                    octave = pitch_el.find("octave").text
+                    alter_el = pitch_el.find("alter")
+                    acc = ""
+                    if alter_el is not None:
+                        try:
+                            v = float(alter_el.text)
+                            acc = "#" if v > 0 else ("b" if v < 0 else "")
+                        except (ValueError, TypeError):
+                            pass
+                    pitch_str = f"{step}{acc}{octave}"
+                else:
+                    pitch_str = "rest"
+
+                notes_out.append({
+                    "measure":   real_measure,
+                    "beat":      round(beat_val, 3),
+                    "pitch":     pitch_str,
+                    "duration":  _TYPE_MAP.get(
+                        type_el.text if type_el is not None else "quarter", "quarter"
+                    ),
+                    "dots":      dots,
+                    "voice":     voice,
+                    "tie_start": any(t.get("type") == "start" for t in tie_els),
+                    "tie_end":   any(t.get("type") == "stop"  for t in tie_els),
+                    "confidence": 0.5,
+                })
+
+    return notes_out
+
+
+def extract_notes_oemer_single(
+    cropped: Image.Image,
+    start_measure: int,
+    end_measure: int,
+) -> list[dict] | None:
+    """단일 보표 이미지에서 oemer로 음표 추출.
+
+    Tier 2-4 악기(현악, 관악, 금관)용. Piano 2단 크롭과 달리 단일 보표 크롭 사용.
+
+    Returns: [note_dict, ...] (part_id 없음 — caller가 설정) 또는 None.
+    """
+    try:
+        import oemer.ete as ete
+    except ImportError:
+        log.error("oemer 미설치.")
+        return None
+
+    cache_dir = _get_cache_dir()
+    img_key   = f"s{_img_hash(cropped)}"   # 's' prefix: single-stave (Piano crop과 충돌 방지)
+    img_path  = str(cache_dir / f"{img_key}.png")
+    mxl_path  = str(cache_dir / f"{img_key}.musicxml")
+
+    if not Path(img_path).exists():
+        cropped.save(img_path)
+
+    class _Args:
+        def __init__(self):
+            self.img_path       = img_path
+            self.output_path    = str(cache_dir)
+            self.use_tf         = False
+            self.save_cache     = True
+            self.without_deskew = True
+
+    if Path(mxl_path).exists():
+        log.debug(f"oemer single cache hit: {img_key}")
+        return _parse_mxl_single(Path(mxl_path).read_bytes(), start_measure, end_measure)
+
+    try:
+        out = ete.extract(_Args())
+    except Exception as e:
+        log.warning(f"oemer single 추출 실패 ({img_key}): {e}")
+        return None
+
+    if out is None or not Path(out).exists():
+        log.warning(f"oemer single MusicXML 없음 ({img_key})")
+        return None
+
+    return _parse_mxl_single(Path(out).read_bytes(), start_measure, end_measure)
+
+
 def extract_notes_oemer(
     cropped: Image.Image,
     start_measure: int,

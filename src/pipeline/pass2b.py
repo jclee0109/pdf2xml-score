@@ -1,4 +1,4 @@
-"""Pass 2b: 음표 추출 — Tier 1 oemer OMR (병렬), Tier 2~4 미구현"""
+"""Pass 2b: 음표 추출 — Tier 1 oemer OMR (병렬), Tier 2~4 단일 보표 oemer"""
 from __future__ import annotations
 
 import json
@@ -11,7 +11,7 @@ from PIL import Image
 
 from ..models.score import RawNote, ScoreLayout, SystemInfo
 from ..utils.render import crop_part_range
-from ..utils.omr import extract_notes_oemer, set_cache_dir
+from ..utils.omr import extract_notes_oemer, extract_notes_oemer_single, set_cache_dir
 
 log = logging.getLogger(__name__)
 
@@ -167,17 +167,47 @@ def notes_to_json(notes: list[RawNote], path: str | Path) -> None:
     Path(path).write_text(json.dumps(data, indent=2, ensure_ascii=False))
 
 
-# ── Tier 2~4: 단일 파트 추출 ──────────────────────────────────────────────────
+# ── Tier 2~4: 단일 보표 oemer 추출 ───────────────────────────────────────────
 
-def extract_notes_single_part(
-    page_img: Image.Image,
-    system: SystemInfo,
-    layout: ScoreLayout,
-    part_name: str,
-) -> list[RawNote]:
-    """단일 파트 음표 추출 — Tier 2~4 미구현 (빈 리스트 반환)."""
-    log.debug(f"Pass 2b [{part_name}]: Tier 2~4 LLM-free 미구현, 스킵")
-    return []
+def _extract_single_part_worker(
+    img_path: str,
+    system_dict: dict,
+    part_idx: int,
+    part_id: str,
+    cache_dir: str,
+) -> list[dict]:
+    """ProcessPoolExecutor worker: 단일 보표 파트 oemer 추출 (Tier 2~4).
+
+    Piano 2단 worker(_extract_system_worker)와 독립적으로 실행.
+    반환: note dict list (part_id / source_system 포함).
+    """
+    from ..utils.omr import extract_notes_oemer_single, set_cache_dir
+    from ..utils.render import crop_part_range
+
+    set_cache_dir(cache_dir)
+    img = Image.open(img_path)
+
+    n_parts = len(system_dict["active_parts"])
+
+    cropped = crop_part_range(
+        img,
+        system_dict["y_top_px"], system_dict["y_bottom_px"],
+        part_idx, part_idx, n_parts,
+        extra_top=10, extra_bottom=5,
+    )
+
+    notes_raw = extract_notes_oemer_single(
+        cropped,
+        system_dict["start_measure"],
+        system_dict["end_measure"],
+    )
+    if notes_raw is None:
+        return []
+
+    return [
+        {**n, "part_id": part_id, "source_system": system_dict["system_index"]}
+        for n in notes_raw
+    ]
 
 
 # ── 병렬 처리용 최상위 함수 (subprocess-safe) ─────────────────────────────────
@@ -264,6 +294,22 @@ def _extract_system_worker(
 
 # ── 메인 진입점 ───────────────────────────────────────────────────────────────
 
+def _tier_parts(layout: ScoreLayout, tiers: list[int]) -> list[tuple[str, str]]:
+    """지정 Tier에 해당하는 (part_id, part_name) 목록. Tier 1(Piano)은 제외."""
+    tier_names: set[str] = set()
+    for t in tiers:
+        if t in TIERS:
+            tier_names.update(TIERS[t])
+    if "extra" in [t for t in tiers if isinstance(t, str)]:
+        tier_names.update(TIER_EXTRA)
+
+    return [
+        (p.id, p.name)
+        for p in layout.parts
+        if p.name in tier_names
+    ]
+
+
 def run_pass2b(
     page_images: list[Image.Image],
     layout: ScoreLayout,
@@ -273,34 +319,20 @@ def run_pass2b(
 ) -> list[RawNote]:
     """Pass 2b 실행.
 
-    parallel=True (기본): 모든 시스템을 ProcessPoolExecutor로 동시 실행.
-    tiers=None이면 Tier 1(Piano)만 처리.
+    tiers=None → Tier 1 (Piano)만 처리.
+    tiers=[1,2,3,4] → 전체 처리 (Tier 2-4: 단일 보표 oemer, 병렬).
+    parallel=True: ProcessPoolExecutor 사용.
     """
     target_tiers = tiers if tiers is not None else [1]
+    do_tier1     = 1 in target_tiers
+    extra_tiers  = [t for t in target_tiers if t != 1]
+
     set_cache_dir(cache_dir)
     cache_dir_str = str(Path(cache_dir).resolve())
 
-    if 1 not in target_tiers or not parallel:
-        # 순차 처리 폴백
-        all_notes: list[RawNote] = []
-        for system in layout.systems:
-            page_img = page_images[system.page - 1]
-            log.info(f"Pass 2b: p{system.page} s{system.system_index} (m{system.start_measure}~{system.end_measure})")
-            notes = extract_notes_for_system(page_img, system, layout)
-            all_notes.extend(notes)
-            log.info(f"  Tier1 → {len(notes)}개")
-        log.info(f"Pass 2b 완료: 총 {len(all_notes)}개 음표")
-        return all_notes
+    # ── 이미지 → 임시 파일 ───────────────────────────────────────────────────
+    parts_list = [{"name": p.name, "clef": p.clef} for p in layout.parts]
 
-    # ── 병렬 처리: 이미지를 임시 파일로 저장 후 worker에 경로 전달 ─────────────
-    import tempfile
-
-    parts_list = [
-        {"name": p.name, "clef": p.clef}
-        for p in layout.parts
-    ]
-
-    # 페이지 이미지 → 임시 PNG 경로
     tmp_dir = Path(cache_dir_str) / "_pages_tmp"
     tmp_dir.mkdir(exist_ok=True)
     img_paths: list[str] = []
@@ -310,7 +342,6 @@ def run_pass2b(
             img.save(p)
         img_paths.append(p)
 
-    # 시스템별 작업 제출
     system_dicts = [
         {
             "page": s.page, "system_index": s.system_index,
@@ -321,39 +352,94 @@ def run_pass2b(
         for s in layout.systems
     ]
 
-    max_workers = min(len(layout.systems), os.cpu_count() or 4)
-    log.info(f"Pass 2b: {len(layout.systems)}시스템 병렬 처리 (workers={max_workers})")
+    # ── 작업 목록 구성 ────────────────────────────────────────────────────────
+    # (worker_fn, *args) 튜플 리스트. label은 로그용.
+    tasks: list[tuple] = []
 
-    results: dict[int, list[dict]] = {}
+    if do_tier1 and parallel:
+        for i, sd in enumerate(system_dicts):
+            tasks.append(("tier1", i, _extract_system_worker,
+                          img_paths[sd["page"] - 1], sd, parts_list, cache_dir_str))
+
+    if extra_tiers:
+        tier_part_list = _tier_parts(layout, extra_tiers)
+        for si, sd in enumerate(system_dicts):
+            active = sd["active_parts"]
+            for pid, pname in tier_part_list:
+                if pid not in active:
+                    continue
+                part_idx = active.index(pid)
+                tasks.append(("tier24", (si, pid), _extract_single_part_worker,
+                              img_paths[sd["page"] - 1], sd, part_idx, pid, cache_dir_str))
+
+    n_tasks = len(tasks)
+    max_workers = min(n_tasks or 1, os.cpu_count() or 4)
+    log.info(
+        f"Pass 2b: Tier {target_tiers}, {n_tasks}개 작업 병렬 처리 (workers={max_workers})"
+    )
+
+    # ── 병렬 실행 ─────────────────────────────────────────────────────────────
+    tier1_results:  dict[int, list[dict]] = {}
+    tier24_results: dict[tuple, list[dict]] = {}
+
+    if not parallel or not tasks:
+        # 순차 폴백 (Tier 1 only, parallel=False)
+        all_notes_seq: list[RawNote] = []
+        for system in layout.systems:
+            page_img = page_images[system.page - 1]
+            notes = extract_notes_for_system(page_img, system, layout)
+            all_notes_seq.extend(notes)
+        log.info(f"Pass 2b 완료 (순차): 총 {len(all_notes_seq)}개 음표")
+        return all_notes_seq
+
     with ProcessPoolExecutor(max_workers=max_workers) as ex:
-        future_to_idx = {
-            ex.submit(
-                _extract_system_worker,
-                img_paths[sd["page"] - 1],
-                sd,
-                parts_list,
-                cache_dir_str,
-            ): i
-            for i, sd in enumerate(system_dicts)
-        }
-        for future in as_completed(future_to_idx):
-            idx = future_to_idx[future]
-            sd = system_dicts[idx]
+        future_map: dict = {}
+        for task in tasks:
+            kind = task[0]
+            key  = task[1]
+            fn   = task[2]
+            args = task[3:]
+            fut  = ex.submit(fn, *args)
+            future_map[fut] = (kind, key)
+
+        for future in as_completed(future_map):
+            kind, key = future_map[future]
             try:
                 note_dicts = future.result()
-                results[idx] = note_dicts
-                log.info(
-                    f"  p{sd['page']} s{sd['system_index']} "
-                    f"m{sd['start_measure']}~{sd['end_measure']} → {len(note_dicts)}개"
-                )
+                if kind == "tier1":
+                    tier1_results[key] = note_dicts
+                    sd = system_dicts[key]
+                    log.info(
+                        f"  [Tier1] p{sd['page']} s{sd['system_index']} "
+                        f"m{sd['start_measure']}~{sd['end_measure']} → {len(note_dicts)}개"
+                    )
+                else:
+                    si, pid = key
+                    tier24_results[key] = note_dicts
+                    sd = system_dicts[si]
+                    log.info(
+                        f"  [Tier2-4] {pid} p{sd['page']} "
+                        f"m{sd['start_measure']}~{sd['end_measure']} → {len(note_dicts)}개"
+                    )
             except Exception as e:
-                log.warning(f"  p{sd['page']} s{sd['system_index']} 실패: {e}")
-                results[idx] = []
+                if kind == "tier1":
+                    sd = system_dicts[key]
+                    log.warning(f"  [Tier1] p{sd['page']} s{key} 실패: {e}")
+                    tier1_results[key] = []
+                else:
+                    si, pid = key
+                    log.warning(f"  [Tier2-4] {pid} sys{si} 실패: {e}")
+                    tier24_results[key] = []
 
-    # 순서대로 합치기
+    # ── 결과 합치기 ───────────────────────────────────────────────────────────
     all_raw: list[RawNote] = []
-    for idx in sorted(results):
-        for nd in results[idx]:
+
+    for idx in sorted(tier1_results):
+        for nd in tier1_results[idx]:
+            all_raw.append(RawNote(**nd))
+
+    for key in sorted(tier24_results, key=lambda k: (k[0], k[1])):
+        for nd in tier24_results[key]:
             all_raw.append(RawNote(**nd))
 
     log.info(f"Pass 2b 완료: 총 {len(all_raw)}개 음표")
