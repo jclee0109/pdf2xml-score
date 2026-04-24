@@ -113,12 +113,22 @@ class RawNote:
     source_system: int
 
 
+@dataclass
+class RawLyric:
+    measure: int
+    beat: float          # x 위치에서 추정한 박자 (근사값)
+    text: str            # 음절 또는 단어
+    part_id: str
+    source_system: int
+
+
 class PipelineStatus(Enum):
     PENDING         = "pending"
     RENDERING       = "rendering"
     PASS1_DONE      = "pass1_done"
     PASS2A_DONE     = "pass2a_done"
     PASS2B_DONE     = "pass2b_done"
+    PASS2C_DONE     = "pass2c_done"
     PASS3_DONE      = "pass3_done"
     BUILDING        = "building"
     AWAITING_REVIEW = "awaiting_review"
@@ -134,5 +144,6 @@ class ScoreDocument:
     layout: ScoreLayout | None = None
     raw_chords: list[RawChord] = field(default_factory=list)
     raw_notes: list[RawNote] = field(default_factory=list)
+    raw_lyrics: list[RawLyric] = field(default_factory=list)
     musicxml_draft: str | None = None
     review_count: int = 0

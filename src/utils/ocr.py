@@ -128,6 +128,75 @@ def normalize_chord(text: str) -> str:
     return text.strip()
 
 
+def extract_lyrics_from_stave(
+    img: Image.Image,
+    lang: str = "kor+eng",
+) -> list[tuple[int, str]]:
+    """보표 크롭 이미지 하단에서 가사(lyrics) 추출.
+
+    알고리즘: 수평 투영법으로 보표 라인 하단 y를 찾고, 그 아래 영역을 OCR.
+    보표 라인이 감지되지 않으면 이미지 하단 40%를 사용.
+
+    Args:
+        img: crop_part_range()로 얻은 단일 보표 크롭 이미지
+        lang: tesseract 언어 코드 (한국 악보는 "kor+eng")
+
+    Returns: [(x_center_px, syllable_text), ...]  x 기준 정렬
+    """
+    import numpy as np
+    arr = np.array(img.convert("L"))
+    h, w = arr.shape
+
+    # 수평 밀도로 보표 라인 하단 y 감지
+    row_density = (arr < 128).sum(axis=1) / w
+    staff_ys = [y for y, d in enumerate(row_density) if d > 0.30]
+    if staff_ys:
+        lyric_y_start = staff_ys[-1] + 5   # 마지막 보표 라인 바로 아래
+    else:
+        lyric_y_start = int(h * 0.60)       # 폴백: 하단 40%
+
+    if lyric_y_start >= h - 5:
+        return []
+
+    lyric_strip = img.crop((0, lyric_y_start, w, h))
+    lw, lh = lyric_strip.size
+    if lw < 10 or lh < 5:
+        return []
+
+    # 2× 업스케일로 OCR 정확도 향상
+    lyric_strip = lyric_strip.resize((lw * 2, lh * 2), Image.LANCZOS)
+
+    try:
+        data = pytesseract.image_to_data(
+            lyric_strip,
+            lang=lang,
+            config="--psm 6 --oem 3",
+            output_type=pytesseract.Output.DICT,
+        )
+    except pytesseract.TesseractError:
+        # kor 언어 데이터가 없으면 eng로 재시도
+        data = pytesseract.image_to_data(
+            lyric_strip,
+            lang="eng",
+            config="--psm 6 --oem 3",
+            output_type=pytesseract.Output.DICT,
+        )
+
+    results: list[tuple[int, str]] = []
+    for i, word in enumerate(data["text"]):
+        word = word.strip()
+        if not word:
+            continue
+        conf = int(data["conf"][i])
+        if conf < 20:
+            continue
+        x_center = (data["left"][i] + data["width"][i] // 2) // 2  # 2× 보정
+        results.append((x_center, word))
+
+    results.sort(key=lambda t: t[0])
+    return results
+
+
 def extract_chord_symbols(img: Image.Image, chord_strip_height: int = 200) -> list[tuple[int, str]]:
     """크롭된 피아노 보표 이미지에서 코드 심볼 추출.
 
