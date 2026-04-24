@@ -204,13 +204,25 @@ def _build_measure_notes(
 
         voice_notes = sorted(by_voice[voice], key=lambda n: (n.beat, n.pitch))
         prev_beat: float | None = None
+        running_ticks = 0
 
         for note in voice_notes:
             is_chord = (prev_beat is not None and note.beat == prev_beat)
+            note_ticks = _note_ticks(note.duration, note.dots)
+
+            # 마디 초과 방지: 다음 음표가 넘치면 중단
+            if not is_chord and running_ticks + note_ticks > measure_ticks:
+                fill = measure_ticks - running_ticks
+                if fill > 0:
+                    fill_el = etree.Element("note")
+                    etree.SubElement(fill_el, "rest")
+                    etree.SubElement(fill_el, "duration").text = str(fill)
+                    etree.SubElement(fill_el, "voice").text = str(voice)
+                    elements.append(fill_el)
+                break
 
             lyric_text: str | None = None
             if voice == 1 and not is_chord and note.pitch != "rest" and lyric_remaining:
-                # 가장 가까운 박자의 가사 배정 (0.5박 이내)
                 best_i = min(range(len(lyric_remaining)),
                              key=lambda i: abs(lyric_remaining[i][0] - note.beat))
                 if abs(lyric_remaining[best_i][0] - note.beat) <= 0.5:
@@ -219,6 +231,16 @@ def _build_measure_notes(
             elements.append(_build_note_element(note, is_chord, lyric_text))
             if not is_chord:
                 prev_beat = note.beat
+                running_ticks += note_ticks
+
+        # 마디 미달 보충: 남은 ticks를 쉼표로 채움
+        fill = measure_ticks - running_ticks
+        if fill > 0:
+            fill_el = etree.Element("note")
+            etree.SubElement(fill_el, "rest")
+            etree.SubElement(fill_el, "duration").text = str(fill)
+            etree.SubElement(fill_el, "voice").text = str(voice)
+            elements.append(fill_el)
 
     return elements
 
