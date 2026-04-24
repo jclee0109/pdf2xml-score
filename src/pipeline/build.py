@@ -1,9 +1,9 @@
-"""MusicXML 빌더 — ValidatedChord + RawNote + ScoreLayout → MusicXML 4.0"""
+"""MusicXML 빌더 — ValidatedChord + RawNote + RawLyric + ScoreLayout → MusicXML 4.0"""
 from __future__ import annotations
 import logging
 from lxml import etree
 
-from ..models.score import ScoreLayout, SystemInfo, RawNote
+from ..models.score import ScoreLayout, SystemInfo, RawNote, RawLyric
 from ..models.chord import ChordSymbol, KEY_FIFTHS
 from .pass3 import ValidatedChord
 
@@ -109,7 +109,18 @@ def _build_rest(time_sig: str) -> etree._Element:
     return note
 
 
-def _build_note_element(n: RawNote, is_chord: bool) -> etree._Element:
+def _build_lyric(text: str, number: int = 1) -> etree._Element:
+    lyric_el = etree.Element("lyric", number=str(number))
+    etree.SubElement(lyric_el, "syllabic").text = "single"
+    etree.SubElement(lyric_el, "text").text = text
+    return lyric_el
+
+
+def _build_note_element(
+    n: RawNote,
+    is_chord: bool,
+    lyric_text: str | None = None,
+) -> etree._Element:
     note_el = etree.Element("note")
 
     if is_chord:
@@ -152,11 +163,23 @@ def _build_note_element(n: RawNote, is_chord: bool) -> etree._Element:
         if n.tie_start:
             etree.SubElement(notations, "tied", type="start")
 
+    # 가사: chord 음표 첫 번째(is_chord=False)에만 붙임
+    if lyric_text and not is_chord and n.pitch != "rest":
+        note_el.append(_build_lyric(lyric_text))
+
     return note_el
 
 
-def _build_measure_notes(notes: list[RawNote], time_sig: str) -> list[etree._Element]:
-    """마디 내 음표 목록 → MusicXML 요소 목록 (backup 포함 다성부 지원)."""
+def _build_measure_notes(
+    notes: list[RawNote],
+    time_sig: str,
+    lyric_pool: list[tuple[float, str]] | None = None,
+) -> list[etree._Element]:
+    """마디 내 음표 목록 → MusicXML 요소 목록 (backup 포함 다성부 지원).
+
+    lyric_pool: [(beat, text), ...] — 이 마디 성악 파트 가사 목록.
+    각 가사는 가장 가까운 박자의 음표에 1회 배정, 소비되면 제거.
+    """
     # 전쉼표(whole rest)는 박자표 무관 "전마디 쉼표" 기호 → 박자표 기반 measure rest로 교체
     if all(n.pitch == "rest" for n in notes):
         return [_build_rest(time_sig)]
@@ -169,10 +192,12 @@ def _build_measure_notes(notes: list[RawNote], time_sig: str) -> list[etree._Ele
     for n in notes:
         by_voice.setdefault(n.voice, []).append(n)
 
+    # 가사 배정: voice 1 음표에만 적용 (성악 멜로디 라인)
+    lyric_remaining = list(lyric_pool) if lyric_pool else []
+
     voices = sorted(by_voice.keys())
     for v_idx, voice in enumerate(voices):
         if v_idx > 0:
-            # 이전 voice 끝 후 마디 처음으로 backup
             backup = etree.Element("backup")
             etree.SubElement(backup, "duration").text = str(measure_ticks)
             elements.append(backup)
@@ -182,7 +207,16 @@ def _build_measure_notes(notes: list[RawNote], time_sig: str) -> list[etree._Ele
 
         for note in voice_notes:
             is_chord = (prev_beat is not None and note.beat == prev_beat)
-            elements.append(_build_note_element(note, is_chord))
+
+            lyric_text: str | None = None
+            if voice == 1 and not is_chord and note.pitch != "rest" and lyric_remaining:
+                # 가장 가까운 박자의 가사 배정 (0.5박 이내)
+                best_i = min(range(len(lyric_remaining)),
+                             key=lambda i: abs(lyric_remaining[i][0] - note.beat))
+                if abs(lyric_remaining[best_i][0] - note.beat) <= 0.5:
+                    lyric_text = lyric_remaining.pop(best_i)[1]
+
+            elements.append(_build_note_element(note, is_chord, lyric_text))
             if not is_chord:
                 prev_beat = note.beat
 
@@ -195,6 +229,7 @@ def build_musicxml(
     layout: ScoreLayout,
     validated_chords: list[ValidatedChord],
     raw_notes: list[RawNote] | None = None,
+    raw_lyrics: list[RawLyric] | None = None,
 ) -> bytes:
     chord_by_measure: dict[int, ValidatedChord] = {c.measure: c for c in validated_chords}
 
@@ -206,15 +241,19 @@ def build_musicxml(
 
     parts_with_notes = {n.part_id for n in (raw_notes or [])}
 
+    # 파트 × 마디 → 가사 목록 [(beat, text), ...]
+    lyrics_lookup: dict[tuple[str, int], list[tuple[float, str]]] = {}
+    if raw_lyrics:
+        for lyr in raw_lyrics:
+            lyrics_lookup.setdefault((lyr.part_id, lyr.measure), []).append((lyr.beat, lyr.text))
+
     # 코드 심볼이 있는 파트 ID 집합 (measure 기준으로 판단)
     chord_part_ids: set[str] = set()
     if validated_chords:
-        # raw_chords의 source_system을 쓸 수 없으므로 layout의 첫 treble 파트로 결정
         from ..pipeline.pass2a import CHORD_SYMBOL_TREBLE_NAMES
         for part in layout.parts:
             if part.name in CHORD_SYMBOL_TREBLE_NAMES:
                 chord_part_ids.add(part.id)
-        # fallback: 알려진 파트가 없으면 첫 treble 파트
         if not chord_part_ids:
             first_treble = next((p for p in layout.parts if p.clef == "treble"), None)
             if first_treble:
@@ -259,8 +298,9 @@ def build_musicxml(
 
             # 음표 또는 전마디 쉼표
             measure_notes = notes_lookup.get((part.id, m_num), [])
+            lyric_pool    = list(lyrics_lookup.get((part.id, m_num), []))
             if has_notes and measure_notes:
-                for el in _build_measure_notes(measure_notes, time_sig):
+                for el in _build_measure_notes(measure_notes, time_sig, lyric_pool):
                     measure_el.append(el)
             else:
                 measure_el.append(_build_rest(time_sig))
@@ -271,9 +311,11 @@ def build_musicxml(
         xml_declaration=True,
         encoding="UTF-8",
     )
-    note_count = len(raw_notes) if raw_notes else 0
+    note_count  = len(raw_notes)  if raw_notes  else 0
+    lyric_count = len(raw_lyrics) if raw_lyrics else 0
     log.info(
         f"MusicXML 생성 완료: {len(layout.parts)}파트, "
-        f"{layout.total_measures}마디, {len(chord_by_measure)}코드, {note_count}음표"
+        f"{layout.total_measures}마디, {len(chord_by_measure)}코드, "
+        f"{note_count}음표, {lyric_count}음절"
     )
     return xml_bytes
