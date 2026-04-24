@@ -157,6 +157,10 @@ def _build_note_element(n: RawNote, is_chord: bool) -> etree._Element:
 
 def _build_measure_notes(notes: list[RawNote], time_sig: str) -> list[etree._Element]:
     """마디 내 음표 목록 → MusicXML 요소 목록 (backup 포함 다성부 지원)."""
+    # 전쉼표(whole rest)는 박자표 무관 "전마디 쉼표" 기호 → 박자표 기반 measure rest로 교체
+    if all(n.pitch == "rest" for n in notes):
+        return [_build_rest(time_sig)]
+
     elements: list[etree._Element] = []
     measure_ticks = _measure_total_ticks(time_sig)
 

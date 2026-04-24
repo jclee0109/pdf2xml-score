@@ -155,6 +155,10 @@ def validate_notes(
             by_voice.setdefault(n.voice, []).append(n)
 
         for voice, v_notes in by_voice.items():
+            # 전쉼표(whole rest)만 있는 마디 = 전마디 쉼표 기호, 박자표와 무관하게 정상
+            if all(n.pitch == "rest" for n in v_notes):
+                continue
+
             # chord 음표(같은 beat 중복)는 한 번만 합산
             seen_beats: dict[float, float] = {}
             for n in v_notes:
