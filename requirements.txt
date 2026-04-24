@@ -3,3 +3,6 @@ Pillow>=10.0.0
 lxml>=5.0.0
 streamlit>=1.30.0
 google-genai>=1.0.0
+opencv-python>=4.9.0
+pytesseract>=0.3.10
+oemer>=0.1.5

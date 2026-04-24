@@ -1,4 +1,4 @@
-"""Pass 2a: 코드 심볼 추출 — Piano 영역 crop + 구조 컨텍스트 주입"""
+"""Pass 2a: 코드 심볼 추출 — Piano 영역 crop + pytesseract OCR"""
 import json
 import logging
 from pathlib import Path
@@ -6,9 +6,8 @@ from pathlib import Path
 from PIL import Image
 
 from ..models.score import RawChord, ScoreLayout, SystemInfo
-from ..utils.json_parser import parse_json_response
 from ..utils.render import crop_part_range
-from ..utils.llm import call_vision
+from ..utils.ocr import extract_chord_symbols
 
 log = logging.getLogger(__name__)
 
@@ -21,21 +20,21 @@ PIANO_TREBLE_NAMES = CHORD_SYMBOL_TREBLE_NAMES
 PIANO_BASS_NAMES   = CHORD_SYMBOL_BASS_NAMES
 
 
-def _build_prompt(start: int, end: int, key: str, time_sig: str) -> str:
-    return f"""이 이미지는 악보의 마디 {start}~{end}에 해당하는 Piano 파트야.
-현재 조성: {key}, 박자: {time_sig}
-
-보표 위에 적힌 코드 심볼을 모두 추출해줘.
-각 코드의 마디 번호는 이미지 왼쪽 숫자를 기준으로 확인해.
-코드가 없는 마디는 건너뛰어.
-
-반드시 JSON만 응답해. 설명 없이:
-[
-  {{"measure": 1, "beat": 1.0, "chord": "G", "confidence": 0.98}},
-  {{"measure": 2, "beat": 1.0, "chord": "Gmaj7", "confidence": 0.95}}
-]
-
-읽기 어려운 경우 confidence를 낮게 (< 0.7) 표시해."""
+def _assign_measures(
+    x_centers: list[int],
+    img_width: int,
+    start_measure: int,
+    end_measure: int,
+) -> list[int]:
+    """x 위치 기반으로 코드를 마디에 균등 배분."""
+    n_measures = max(end_measure - start_measure + 1, 1)
+    measure_width = img_width / n_measures
+    measures = []
+    for x in x_centers:
+        idx = int(x // measure_width)
+        idx = min(idx, n_measures - 1)
+        measures.append(start_measure + idx)
+    return measures
 
 
 def _find_chord_part_indices(
@@ -101,28 +100,27 @@ def extract_chords_for_system(
         treble_idx, bass_idx, n_parts,
     )
 
-    prompt = _build_prompt(system.start_measure, system.end_measure,
-                           system.key, system.time_signature)
-    raw = call_vision(cropped, prompt, max_tokens=1024)
-    data = parse_json_response(raw, f"pass2a_p{system.page}_s{system.system_index}")
-
-    if data is None:
-        log.warning(f"Pass 2a: 시스템 p{system.page}/s{system.system_index} 파싱 실패")
+    hits = extract_chord_symbols(cropped)
+    if not hits:
+        log.debug(f"Pass 2a: p{system.page}/s{system.system_index} 코드 없음")
         return []
 
+    x_centers = [x for x, _ in hits]
+    measures = _assign_measures(
+        x_centers, cropped.width,
+        system.start_measure, system.end_measure,
+    )
+
     chords = []
-    for item in data:
-        try:
-            chords.append(RawChord(
-                measure=int(item["measure"]),
-                beat=float(item.get("beat", 1.0)),
-                chord_text=str(item["chord"]),
-                confidence=float(item.get("confidence", 0.5)),
-                source_page=system.page,
-                source_system=system.system_index,
-            ))
-        except (KeyError, ValueError) as e:
-            log.warning(f"Pass 2a: 코드 항목 파싱 오류 {item}: {e}")
+    for (x, chord_text), measure in zip(hits, measures):
+        chords.append(RawChord(
+            measure=measure,
+            beat=1.0,
+            chord_text=chord_text,
+            confidence=0.6,
+            source_page=system.page,
+            source_system=system.system_index,
+        ))
 
     return chords
 
