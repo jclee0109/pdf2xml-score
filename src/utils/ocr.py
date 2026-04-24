@@ -26,11 +26,23 @@ def _infer_clef(name: str) -> str:
     return "treble"
 
 
-def extract_instrument_names(img: Image.Image, margin_width: int = 160) -> list[dict]:
+def extract_instrument_names(img: Image.Image, margin_width: int = 0) -> list[dict]:
     """악보 첫 페이지 왼쪽 여백에서 악기명 목록 추출.
+
+    margin_width=0 이면 수직 바라인 x 위치를 자동 감지해 사용.
 
     Returns: [{"name": str, "clef": str}, ...]
     """
+    if margin_width == 0:
+        # 수직 시스템 바라인 x를 자동 감지
+        try:
+            from .staff_detect import _find_system_barline_x, _to_gray
+            import numpy as np
+            gray = _to_gray(img)
+            barline_x, _ = _find_system_barline_x(gray)
+            margin_width = barline_x if barline_x > 100 else 520
+        except Exception:
+            margin_width = 520
     cropped = img.crop((0, 0, margin_width, img.height))
     # 업스케일링으로 OCR 정확도 향상
     scale = 2
@@ -40,11 +52,24 @@ def extract_instrument_names(img: Image.Image, margin_width: int = 160) -> list[
     text = pytesseract.image_to_string(cropped, config="--psm 6 --oem 3")
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
 
+    # 악기명이 아닌 라인 제외 패턴
+    _EXCLUDE = re.compile(
+        r'(?i)^(full\s*score|score|conductor|piano\s*score|'
+        r'transposed|concert|arr\.|arranged|edited|copyright|©|\d+)$'
+    )
+
     parts = []
     seen: set[str] = set()
     for line in lines:
         # 숫자·특수문자만 있는 라인 제거
         if re.fullmatch(r'[\d\W]+', line):
+            continue
+        # 제목·범용 라인 제거
+        if _EXCLUDE.match(line):
+            continue
+        # 파이프/브라켓 등 노이즈 문자 제거
+        line = re.sub(r'\s*[|{}\[\]]\s*', ' ', line).strip()
+        if not line:
             continue
         name = line
         if name in seen:
@@ -103,7 +128,7 @@ def normalize_chord(text: str) -> str:
     return text.strip()
 
 
-def extract_chord_symbols(img: Image.Image, chord_strip_height: int = 45) -> list[tuple[int, str]]:
+def extract_chord_symbols(img: Image.Image, chord_strip_height: int = 200) -> list[tuple[int, str]]:
     """크롭된 피아노 보표 이미지에서 코드 심볼 추출.
 
     Args:

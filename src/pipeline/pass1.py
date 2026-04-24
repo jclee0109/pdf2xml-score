@@ -104,6 +104,23 @@ def layout_from_json(path: str | Path) -> ScoreLayout:
     ]
     name_to_id = {p.name: p.id for p in parts}
 
+    id_to_name = {p.id: p.name for p in parts}
+
+    def _normalize_active(raw: list[str]) -> list[str]:
+        """active_parts 가 이름이면 ID로 변환, 이미 ID면 그대로."""
+        result = []
+        for item in raw:
+            if item in name_to_id:          # item == name
+                result.append(name_to_id[item])
+            elif item in id_to_name:        # item == ID (e.g. "P0")
+                result.append(item)
+            else:
+                # 부분 문자열 매칭 폴백
+                pid = next((v for k, v in name_to_id.items() if item in k or k in item), None)
+                if pid:
+                    result.append(pid)
+        return result
+
     systems = []
     for s in data["systems"]:
         systems.append(SystemInfo(
@@ -115,7 +132,7 @@ def layout_from_json(path: str | Path) -> ScoreLayout:
             time_signature=s.get("time_signature") or s.get("time", "4/4"),
             y_top_px=s["y_top_px"],
             y_bottom_px=s["y_bottom_px"],
-            active_parts=s["active_parts"],
+            active_parts=_normalize_active(s["active_parts"]),
             rehearsal_marks=[RehearsalMark(**m) for m in s.get("rehearsal_marks", [])],
             repeat_barlines=[RepeatBarline(**m) for m in s.get("repeat_barlines", [])],
             volta_brackets=[VoltaBracket(**m) for m in s.get("volta_brackets", [])],
