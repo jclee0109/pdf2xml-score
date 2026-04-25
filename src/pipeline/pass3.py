@@ -1,6 +1,8 @@
-"""Pass 3: 음악 이론 검증 — Rule 1~4"""
+"""Pass 3: 음악 이론 검증 — Rule 1~6"""
 from __future__ import annotations
 import logging
+import statistics
+from collections import defaultdict
 from dataclasses import dataclass, field
 
 from ..models.score import RawChord, RawNote, ScoreLayout, SystemInfo
@@ -180,3 +182,165 @@ def validate_notes(
         log.info("Rule 4: 모든 마디 duration 정상")
 
     return raw_notes
+
+
+# ── Rule 5~6: 음표 이상 탐지 ──────────────────────────────────────────────────
+
+_PITCH_CLASS: dict[str, int] = {
+    "C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11,
+}
+
+# 악기 음역 — written pitch (악보에 표기된 그대로) 기준 MIDI
+# 이조 악기는 written pitch로 비교 (pipeline이 written pitch 저장)
+_RANGE_MAP: list[tuple[tuple[str, ...], int, int]] = [
+    (("piccolo",),                  62, 102),  # D4–F#7  (written, sounds 8va alta)
+    (("flute",),                    60, 100),  # C4–E7
+    (("oboe",),                     58,  93),  # Bb3–A6
+    (("clarinet",),                 50,  94),  # D3–Bb6  (written, sounds major 2nd lower)
+    (("bassoon",),                  34,  75),  # Bb1–Eb5
+    (("horn",),                     35,  84),  # B1–C6   (written, sounds perfect 5th lower)
+    (("trumpet",),                  52,  86),  # E3–D6   (written, sounds major 2nd lower)
+    (("trombone", "tuba"),          28,  67),  # E1–G4
+    (("timpani",),                  41,  65),  # F2–F4
+    (("violin",),                   55, 100),  # G3–E7
+    (("viola",),                    48,  91),  # C3–G6
+    (("violoncello", "cello"),      36,  84),  # C2–C6
+    (("contrabass", "bass"),        28,  72),  # E1–C5   (written, sounds 8va bassa)
+    (("piano",),                    21, 108),  # A0–C8
+]
+
+_LEAP_SEMITONES = 13   # 단9도 이상이면 의심 (옥타브+반음)
+_COUNT_HIGH_K   = 3.0  # 파트 중앙값 × 이 배수 이상이면 과다
+_COUNT_LOW_K    = 0.25 # 파트 중앙값 × 이 배수 이하면 과소 (0은 제외)
+
+
+def _to_midi(pitch: str) -> int | None:
+    """'G4' → 67, 'F#5' → 78, 'Bb3' → 46, 'rest' → None."""
+    if pitch == "rest" or not pitch:
+        return None
+    try:
+        if len(pitch) >= 3 and pitch[1] in ("#", "b"):
+            step, alter, octave = pitch[0], (1 if pitch[1] == "#" else -1), int(pitch[2:])
+        else:
+            step, alter, octave = pitch[0], 0, int(pitch[1:])
+        return (octave + 1) * 12 + _PITCH_CLASS[step.upper()] + alter
+    except (KeyError, ValueError):
+        return None
+
+
+def _part_range(part_name: str) -> tuple[int, int] | None:
+    name_lower = part_name.lower()
+    for keywords, lo, hi in _RANGE_MAP:
+        if any(k in name_lower for k in keywords):
+            return lo, hi
+    return None
+
+
+def check_note_anomalies(
+    raw_notes: list[RawNote],
+    layout: ScoreLayout,
+) -> dict[tuple[str, int], list[str]]:
+    """Rule 5~6: 음표 이상 탐지.
+
+    Returns:
+        {(part_id, measure): [anomaly_description, ...]}
+
+    Rule 5 — 음역 도약 이상:
+        같은 voice 연속 음표 사이 도약이 _LEAP_SEMITONES 반음 이상이면 플래그.
+        단, 옥타브 유니즌(정확히 12반음 도약)은 의도적 옥타브 이동이 많으므로 제외.
+
+    Rule 6 — 마디별 음표 수 이상치:
+        파트별 마디당 음표 수의 중앙값을 구하고, 그 중앙값의 _COUNT_HIGH_K배 이상이거나
+        _COUNT_LOW_K배 이하(단 0 제외)인 마디를 플래그.
+
+    Rule 7 — 악기 음역 이탈:
+        알려진 악기 음역(_RANGE_MAP)을 벗어난 음표가 있는 마디를 플래그.
+    """
+    anomalies: dict[tuple[str, int], list[str]] = defaultdict(list)
+
+    # 파트 이름 조회
+    part_name_map = {p.id: p.name for p in layout.parts}
+
+    # (part_id, voice) → measure 순 음표 목록
+    by_pv: dict[tuple[str, int], list[RawNote]] = defaultdict(list)
+    for n in raw_notes:
+        if n.pitch != "rest":
+            by_pv[(n.part_id, n.voice)].append(n)
+
+    for pv, notes in by_pv.items():
+        pid, _ = pv
+        notes_sorted = sorted(notes, key=lambda n: (n.measure, n.beat))
+
+        # ── Rule 5: 도약 이상 ──────────────────────────────────────────────
+        prev_midi: int | None = None
+        prev_measure: int | None = None
+        for n in notes_sorted:
+            midi = _to_midi(n.pitch)
+            if midi is None:
+                continue
+            if prev_midi is not None:
+                leap = abs(midi - prev_midi)
+                # 정확히 12반음(옥타브)은 의도적 이동으로 허용
+                if leap >= _LEAP_SEMITONES and leap != 12:
+                    key = (pid, n.measure)
+                    msg = f"Rule 5: 도약 {leap}반음 ({notes_sorted[notes_sorted.index(n)-1].pitch}→{n.pitch})"
+                    if msg not in anomalies[key]:
+                        anomalies[key].append(msg)
+                        log.debug(f"  {pid} m{n.measure}: {msg}")
+            prev_midi = midi
+            prev_measure = n.measure
+
+    # ── Rule 6: 마디별 음표 수 이상치 ─────────────────────────────────────
+    # 파트별 (measure → 음표 수) 집계 (쉼표 제외, chord 중복 포함)
+    by_part_m: dict[str, dict[int, int]] = defaultdict(dict)
+    for n in raw_notes:
+        if n.pitch != "rest":
+            by_part_m[n.part_id][n.measure] = \
+                by_part_m[n.part_id].get(n.measure, 0) + 1
+
+    for pid, m_counts in by_part_m.items():
+        counts = list(m_counts.values())
+        if len(counts) < 3:
+            continue
+        med = statistics.median(counts)
+        if med == 0:
+            continue
+        for m, cnt in m_counts.items():
+            if cnt > med * _COUNT_HIGH_K:
+                msg = f"Rule 6: 음표 수 과다 ({cnt}개, 중앙값 {med:.0f})"
+                anomalies[(pid, m)].append(msg)
+                log.debug(f"  {pid} m{m}: {msg}")
+            elif 0 < cnt < med * _COUNT_LOW_K:
+                msg = f"Rule 6: 음표 수 과소 ({cnt}개, 중앙값 {med:.0f})"
+                anomalies[(pid, m)].append(msg)
+                log.debug(f"  {pid} m{m}: {msg}")
+
+    # ── Rule 7: 악기 음역 이탈 ────────────────────────────────────────────
+    for n in raw_notes:
+        if n.pitch == "rest":
+            continue
+        midi = _to_midi(n.pitch)
+        if midi is None:
+            continue
+        rng = _part_range(part_name_map.get(n.part_id, ""))
+        if rng is None:
+            continue
+        lo, hi = rng
+        if not (lo <= midi <= hi):
+            msg = f"Rule 7: 음역 이탈 {n.pitch} (허용 {_to_pitch(lo)}–{_to_pitch(hi)})"
+            key = (n.part_id, n.measure)
+            if msg not in anomalies[key]:
+                anomalies[key].append(msg)
+                log.debug(f"  {n.part_id} m{n.measure}: {msg}")
+
+    total = sum(len(v) for v in anomalies.values())
+    log.info(f"Rule 5~7: {len(anomalies)}개 (part, measure)에서 {total}개 이상 감지")
+    return dict(anomalies)
+
+
+def _to_pitch(midi: int) -> str:
+    """67 → 'G4'  (Rule 7 로그용)."""
+    names = ["C", "C#", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B"]
+    octave = midi // 12 - 1
+    name   = names[midi % 12]
+    return f"{name}{octave}"

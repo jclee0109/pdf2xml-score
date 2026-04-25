@@ -56,7 +56,8 @@ def load_all():
     validated = validate_chords(chords, layout)
     notes     = notes_from_json(NOTES_PATH)   if NOTES_PATH.exists()   else []
     lyrics    = lyrics_from_json(LYRICS_PATH) if LYRICS_PATH.exists()  else []
-    return layout, validated, notes, lyrics
+    anomalies = check_note_anomalies(notes, layout) if notes else {}
+    return layout, validated, notes, lyrics, anomalies
 
 @st.cache_data
 def load_page_img(page: int) -> Image.Image:
@@ -101,10 +102,12 @@ def measure_confidence(
     raw_notes: list[RawNote],
     validated_chords: list[ValidatedChord],
     rule4_flags: set[tuple[str, int]],
+    anomalies: dict[tuple[str, int], list[str]],
 ) -> tuple[float, list[str]]:
     conf  = 1.0
     flags: list[str] = []
 
+    # 코드 심볼 (Rule 1~3)
     for vc in validated_chords:
         if vc.measure == m and vc.needs_review:
             conf = min(conf, vc.confidence)
@@ -117,10 +120,24 @@ def measure_confidence(
             conf = min(conf, mn)
             flags.append(f"음표 신뢰도 {mn:.0%}")
 
+    # Rule 4: 박자 불일치
     bad_parts = [pid for (pid, mm) in rule4_flags if mm == m]
     if bad_parts:
         conf = min(conf, 0.40)
         flags.append(f"박자 불일치: {', '.join(bad_parts)}")
+
+    # Rule 5~7: 음표 이상 (도약, 음표 수 이상치, 음역 이탈)
+    anom_msgs: list[str] = []
+    for (pid, mm), msgs in anomalies.items():
+        if mm == m:
+            anom_msgs.extend(msgs)
+    if anom_msgs:
+        # 도약/이상치 → 🟡(0.55), 음역 이탈 → 🔴(0.45)
+        has_range = any("Rule 7" in msg for msg in anom_msgs)
+        penalty   = 0.45 if has_range else 0.55
+        conf      = min(conf, penalty)
+        for msg in anom_msgs:
+            flags.append(msg)
 
     return conf, flags
 
@@ -180,7 +197,7 @@ def rebuild_musicxml(corrections: dict) -> str:
     from src.pipeline.build import build_musicxml
     from src.models.chord import parse_chord_text
 
-    layout, validated, raw_notes, raw_lyrics = load_all()
+    layout, validated, raw_notes, raw_lyrics, _ = load_all()
 
     # 코드 수정 적용
     chord_corr = corrections.get("chords", {})
@@ -444,7 +461,7 @@ def main():
         st.error("output/ 폴더에 pass1_layout.json이 없습니다. 파이프라인을 먼저 실행하세요.")
         return
 
-    layout, validated, raw_notes, raw_lyrics = load_all()
+    layout, validated, raw_notes, raw_lyrics, anomalies = load_all()
     rule4_flags = compute_rule4_flags(raw_notes, layout)
     corrections  = load_corrections()
 
@@ -452,7 +469,7 @@ def main():
     conf_map: dict[int, float]       = {}
     flag_map: dict[int, list[str]]   = {}
     for m in range(1, layout.total_measures + 1):
-        c, f          = measure_confidence(m, raw_notes, validated, rule4_flags)
+        c, f          = measure_confidence(m, raw_notes, validated, rule4_flags, anomalies)
         conf_map[m]   = c
         flag_map[m]   = f
 
