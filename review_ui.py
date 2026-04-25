@@ -185,8 +185,20 @@ def save_corrections(c: dict) -> None:
 
 # ── MusicXML 재생성 ───────────────────────────────────────────────────────────
 
-def rebuild_musicxml(corrections: dict) -> str:
-    from src.pipeline.pass3 import ValidatedChord as VC
+
+def estimate_measure_x_ratio(measure: int, system: SystemInfo) -> float:
+    """마디 번호 → 시스템 내 x 위치 비율 (균등 추정)."""
+    total = system.end_measure - system.start_measure + 1
+    idx   = measure - system.start_measure
+    return (idx + 0.5) / total
+
+
+# ── 파이프라인 재실행 ─────────────────────────────────────────────────────────
+
+def rebuild_musicxml(corrections: dict[str, str]) -> str:
+    from src.pipeline.pass2b import notes_from_json
+    from src.pipeline.pass2c import lyrics_from_json
+    from src.pipeline.pass3 import validate_notes
     from src.pipeline.build import build_musicxml
     from src.models.chord import parse_chord_text
 
@@ -224,12 +236,13 @@ def rebuild_musicxml(corrections: dict) -> str:
                 part_id=pid, source_system=0,
             ))
 
-    for n in raw_notes:
-        if (n.part_id, n.measure) not in replaced:
-            corrected_notes.append(n)
+    notes_path  = OUTPUT_DIR / "pass2b_notes.json"
+    lyrics_path = OUTPUT_DIR / "pass2c_lyrics.json"
+    raw_notes   = notes_from_json(notes_path)   if notes_path.exists()  else []
+    raw_lyrics  = lyrics_from_json(lyrics_path) if lyrics_path.exists() else []
+    raw_notes   = validate_notes(raw_notes, layout)
 
-    corrected_notes = validate_notes(corrected_notes, layout)
-    xml_bytes = build_musicxml(layout, corrected_chords, corrected_notes, raw_lyrics or None)
+    xml_bytes = build_musicxml(layout, corrected, raw_notes, raw_lyrics or None)
     out_path  = OUTPUT_DIR / "output.musicxml"
     out_path.write_bytes(xml_bytes)
     return str(out_path)
