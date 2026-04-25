@@ -183,14 +183,15 @@ def render_extracted_notation(
     validated_chords: list[ValidatedChord],
     time_sig: str,
     anomalies: dict[tuple[str, int], list[str]],
-    width: int = 600,
+    selected_key: str | None = None,
+    width: int = 860,
 ) -> Image.Image:
     """마디 m의 추출된 음표를 오선보로 렌더링.
 
     - 음표 색상: 🔴 conf<0.5 / 🟡 0.5~0.75 / 🟢 ≥0.75
+    - 선택된 음표(selected_key = "partid:beatidx")는 파란 테두리로 강조
     - 플래그된 음표에 ✕ 마크
-    - 파트별 오선 스택
-    - 코드 심볼 상단 표시
+    - 파트별 오선 스택, 코드 심볼 상단 표시
     """
     # 이 마디의 파트 목록 (음표 있는 것만)
     m_notes = [n for n in raw_notes if n.measure == m and n.pitch != "rest"]
@@ -206,26 +207,27 @@ def render_extracted_notation(
         if mm == m:
             all_anom_msgs.extend(msgs)
 
-    # ── 레이아웃 상수 ──────────────────────────────────────────────────────────
-    MARGIN_L   = 55
-    MARGIN_R   = 20
-    LS         = 10          # line spacing (px)
+    # ── 레이아웃 상수 (크고 선명하게) ────────────────────────────────────────
+    MARGIN_L   = 70
+    MARGIN_R   = 24
+    LS         = 16          # line spacing (px) — 이전보다 크게
     STAFF_H    = 4 * LS      # 5선 높이
-    NOTE_RX    = 5           # 음표 머리 가로 반지름
-    NOTE_RY    = 4           # 음표 머리 세로 반지름
-    PART_GAP   = 30          # 파트 간 간격
-    HEADER_H   = 40          # 상단 코드/제목 영역
-    FLAG_H     = max(0, len(all_anom_msgs) * 16 + 8)
+    NOTE_RX    = 7
+    NOTE_RY    = 5
+    PART_GAP   = 40
+    CHORD_H    = 28
+    LABEL_H    = 20          # 피치 레이블 영역
+    FLAG_H     = max(0, len(all_anom_msgs) * 18 + 10)
 
     n_staves = max(len(parts_with_notes), 1)
-    total_h  = HEADER_H + n_staves * (STAFF_H + PART_GAP) + FLAG_H + 10
+    total_h  = CHORD_H + n_staves * (STAFF_H + PART_GAP + LABEL_H) + FLAG_H + 20
 
-    img  = Image.new("RGB", (width, total_h), (255, 255, 255))
+    img  = Image.new("RGB", (width, total_h), (252, 252, 252))
     draw = ImageDraw.Draw(img)
 
     # ── 코드 심볼 ─────────────────────────────────────────────────────────────
     if chord_label:
-        draw.text((MARGIN_L, 8), chord_label, fill=(50, 50, 180))
+        draw.text((MARGIN_L, 6), chord_label, fill=(40, 40, 200))
 
     # ── 박자 → x 변환 ─────────────────────────────────────────────────────────
     beats_num, beat_type = time_sig.split("/")
@@ -234,26 +236,40 @@ def render_extracted_notation(
 
     def beat_x(beat: float) -> int:
         ratio = max(0.0, min(1.0, (beat - 1.0) / beats_per_m))
-        return int(MARGIN_L + 15 + ratio * (staff_w - 20))
+        return int(MARGIN_L + 20 + ratio * (staff_w - 30))
 
     # ── 파트별 오선 그리기 ─────────────────────────────────────────────────────
     for s_idx, pid in enumerate(parts_with_notes):
         part      = layout.parts[int(pid[1:])]
         clef      = part.clef
-        staff_top = HEADER_H + s_idx * (STAFF_H + PART_GAP)
+        staff_top = CHORD_H + s_idx * (STAFF_H + PART_GAP + LABEL_H)
         staff_bot = staff_top + STAFF_H
+
+        # 파트명
+        draw.text((2, staff_top + LS), part.name[:14], fill=(100, 100, 100))
+
+        # 배경 밴드 (파트 구분)
+        draw.rectangle(
+            [(0, staff_top - 6), (width, staff_bot + LABEL_H + PART_GAP // 2)],
+            fill=(248, 248, 255),
+        )
 
         # 오선 5개
         for li in range(5):
             ly = staff_bot - li * LS
-            draw.line([(MARGIN_L, ly), (width - MARGIN_R, ly)], fill=(180, 180, 180), width=1)
+            lw = 1 if li != 2 else 2   # 중간선 두껍게
+            draw.line([(MARGIN_L, ly), (width - MARGIN_R, ly)], fill=(160, 160, 170), width=lw)
 
-        # 파트명 (작게)
-        draw.text((2, staff_top + LS), part.name[:12], fill=(120, 120, 120))
+        # 세로 바라인 (시작 · 끝)
+        draw.line([(MARGIN_L, staff_top), (MARGIN_L, staff_bot)], fill=(80, 80, 80), width=2)
+        draw.line([(width - MARGIN_R, staff_top), (width - MARGIN_R, staff_bot)], fill=(80, 80, 80), width=1)
 
-        # 클레프 기호 (단순 텍스트)
-        clef_char = {"treble": "𝄞", "bass": "𝄢", "alto": "𝄡", "tenor": "𝄡"}.get(clef, "𝄞")
-        draw.text((MARGIN_L - 18, staff_top - 2), clef_char, fill=(80, 80, 80))
+        # 박자 그리드 (반투명 수직선)
+        half_beat = beats_per_m / 2
+        for b_frac in range(1, int(beats_per_m * 2)):
+            bx = beat_x(1.0 + b_frac * 0.5)
+            lc = (200, 200, 220) if b_frac % 2 == 0 else (220, 220, 235)
+            draw.line([(bx, staff_top), (bx, staff_bot)], fill=lc, width=1)
 
         # 이 파트의 이마디 음표
         part_notes = [n for n in m_notes if n.part_id == pid]
@@ -263,8 +279,17 @@ def render_extracted_notation(
         for n in part_notes:
             by_beat.setdefault(round(n.beat, 3), []).append(n)
 
-        for beat, chord_notes in sorted(by_beat.items()):
+        for b_idx, (beat, chord_notes) in enumerate(sorted(by_beat.items())):
             x = beat_x(beat)
+
+            # 선택된 음표 하이라이트 (배경 박스)
+            note_key = f"{pid}:{b_idx}"
+            is_selected = (selected_key == note_key)
+            if is_selected:
+                draw.rectangle(
+                    [(x - 14, staff_top - 2), (x + 14, staff_bot + 2)],
+                    fill=(220, 235, 255), outline=(60, 120, 220), width=2,
+                )
 
             for n in chord_notes:
                 pos = _pitch_staff_pos(n.pitch, clef)
@@ -273,49 +298,56 @@ def render_extracted_notation(
 
                 y = staff_bot - int(pos * LS)
 
-                # 올려 긋기선 (오선 밖 음표)
-                for ledger_pos in range(0, int(pos * 2) - 1, -2):
-                    if ledger_pos % 2 == 0:
-                        ly = staff_bot - int(ledger_pos / 2 * LS)
-                        draw.line([(x - 9, ly), (x + 9, ly)], fill=(160, 160, 160), width=1)
-                for ledger_pos in range(10, int(pos * 2) + 2, 2):
-                    if ledger_pos % 2 == 0:
-                        ly = staff_bot - int(ledger_pos / 2 * LS)
-                        draw.line([(x - 9, ly), (x + 9, ly)], fill=(160, 160, 160), width=1)
+                # 올려 긋기선
+                for lp in range(-2, int(pos * 2) - 1, -2):
+                    ly = staff_bot - int(lp / 2 * LS)
+                    draw.line([(x - 11, ly), (x + 11, ly)], fill=(140, 140, 150), width=1)
+                for lp in range(10, int(pos * 2) + 2, 2):
+                    ly = staff_bot - int(lp / 2 * LS)
+                    draw.line([(x - 11, ly), (x + 11, ly)], fill=(140, 140, 150), width=1)
 
                 # 음표 머리
                 color = _note_color(n.confidence)
+                outline = (60, 120, 220) if is_selected else (30, 30, 30)
                 draw.ellipse(
                     [(x - NOTE_RX, y - NOTE_RY), (x + NOTE_RX, y + NOTE_RY)],
-                    fill=color, outline=(0, 0, 0), width=1,
+                    fill=color, outline=outline, width=2 if is_selected else 1,
                 )
 
-                # 이상 플래그된 음표 → ✕ 마크
+                # 이상 플래그 ✕
                 if (pid, m) in anomalies:
-                    draw.line([(x - 6, y - 6), (x + 6, y + 6)], fill=(180, 0, 0), width=2)
-                    draw.line([(x + 6, y - 6), (x - 6, y + 6)], fill=(180, 0, 0), width=2)
+                    draw.line([(x - 8, y - 8), (x + 8, y + 8)], fill=(180, 0, 0), width=2)
+                    draw.line([(x + 8, y - 8), (x - 8, y + 8)], fill=(180, 0, 0), width=2)
 
-        # 쉼표 마디 (음표 없음) 표시
+            # 음표 레이블 (오선 아래)
+            label_y = staff_bot + 4
+            label_parts = []
+            for n in chord_notes:
+                label_parts.append(n.pitch)
+            draw.text((x - 8, label_y), ",".join(label_parts[:2]), fill=(80, 80, 100))
+
+        # 쉼표 마디
         if not part_notes:
-            mid_y = staff_top + STAFF_H // 2
+            mid_y = (staff_top + staff_bot) // 2
             draw.rectangle(
-                [(width // 2 - 15, mid_y - 4), (width // 2 + 15, mid_y + 2)],
-                fill=(180, 180, 180),
+                [(width // 2 - 18, mid_y - 5), (width // 2 + 18, mid_y + 3)],
+                fill=(190, 190, 200),
             )
+            draw.text((width // 2 - 12, mid_y + 6), "쉼표", fill=(150, 150, 160))
 
     # ── 플래그 설명 ──────────────────────────────────────────────────────────
-    flag_y = HEADER_H + n_staves * (STAFF_H + PART_GAP)
+    flag_y = CHORD_H + n_staves * (STAFF_H + PART_GAP + LABEL_H) + 4
     for msg in all_anom_msgs:
-        color = (180, 0, 0) if "Rule 7" in msg else (160, 100, 0)
-        draw.text((MARGIN_L, flag_y), f"⚠ {msg}", fill=color)
-        flag_y += 16
+        fc = (180, 0, 0) if "Rule 7" in msg else (150, 90, 0)
+        draw.text((MARGIN_L, flag_y), f"⚠ {msg}", fill=fc)
+        flag_y += 18
 
     # ── 신뢰도 범례 (우하단) ─────────────────────────────────────────────────
-    legend_x, legend_y = width - 130, total_h - 22
-    for label, color, cval in [("낮음", (210,50,50), 0.3), ("중간", (210,160,0), 0.6), ("높음", (50,170,80), 0.9)]:
-        draw.ellipse([(legend_x, legend_y+2), (legend_x+8, legend_y+10)], fill=color)
-        draw.text((legend_x + 12, legend_y), label, fill=(100, 100, 100))
-        legend_x += 42
+    lx, ly_leg = width - 145, total_h - 18
+    for lbl, lc in [("낮음", (210,50,50)), ("중간", (210,160,0)), ("높음", (50,170,80))]:
+        draw.ellipse([(lx, ly_leg+1), (lx+10, ly_leg+11)], fill=lc)
+        draw.text((lx + 13, ly_leg), lbl, fill=(110, 110, 110))
+        lx += 50
 
     return img
 
@@ -581,6 +613,12 @@ def show_note_section(
 
 # ── 선택 마디 상세 패널 ───────────────────────────────────────────────────────
 
+_DUR_SYM = {
+    "whole": "𝅝", "half": "♩", "quarter": "♩", "eighth": "♪",
+    "16th": "𝅘𝅥𝅮", "32nd": "𝅘𝅥𝅯",
+}
+
+
 def show_detail_panel(
     m: int,
     layout: ScoreLayout,
@@ -592,57 +630,192 @@ def show_detail_panel(
     corrections: dict,
     anomalies: dict[tuple[str, int], list[str]],
 ) -> None:
-    sys = next((s for s in layout.systems
-                if s.start_measure <= m <= s.end_measure), None)
-    if sys is None:
+    sys_info = next((s for s in layout.systems
+                     if s.start_measure <= m <= s.end_measure), None)
+    if sys_info is None:
         return
 
     conf  = conf_map.get(m, 1.0)
     flags = flag_map.get(m, [])
     badge = _conf_badge(conf)
 
-    st.markdown(f"## {badge} 마디 {m} &nbsp; `{sys.key}` &nbsp; `{sys.time_signature}`")
+    # 선택된 음표 state 키
+    sel_key_state = f"sel_note_{m}"
+    selected_key  = st.session_state.get(sel_key_state)
 
-    # ── 플래그 요약 ──────────────────────────────────────────────────────────
-    if flags:
-        for f in flags:
-            st.warning(f, icon="⚠️")
-
-    # ── 좌: 원본 | 우: 생성본 ────────────────────────────────────────────────
-    col_orig, col_gen = st.columns([1, 1], gap="large")
-
-    with col_orig:
-        st.caption("📄 원본")
-        page_img = load_page_img(sys.page)
-        crop     = render_measure_crop(page_img, sys, m, conf)
-        if crop.height < 80:
-            scale = max(1, 80 // crop.height)
-            crop  = crop.resize((crop.width * scale, crop.height * scale), Image.NEAREST)
-        st.image(crop, use_container_width=True)
-
-    with col_gen:
-        st.caption("🎵 추출된 악보 (confidence 색상: 🔴낮음 🟡중간 🟢높음)")
-        notation = render_extracted_notation(
-            m, raw_notes, layout, validated_chords,
-            sys.time_signature, anomalies,
-        )
-        st.image(notation, use_container_width=True)
-
-    # 신뢰도 게이지 (한 줄)
+    # ── 헤더 ──────────────────────────────────────────────────────────────────
+    hcol1, hcol2 = st.columns([3, 1])
+    hcol1.markdown(f"## {badge} 마디 {m} &nbsp; `{sys_info.key}` &nbsp; `{sys_info.time_signature}`")
     pct   = int(conf * 100)
-    color = "#e55" if conf < 0.5 else ("#fa0" if conf < 0.75 else "#4c4")
-    st.markdown(
-        f"<div style='background:#ddd;border-radius:4px;height:8px;margin:6px 0 2px'>"
-        f"<div style='background:{color};width:{pct}%;height:8px;border-radius:4px'></div>"
-        f"</div><p style='font-size:11px;color:#888;margin:0'>신뢰도 {pct}%</p>",
+    gc    = "#e55" if conf < 0.5 else ("#fa0" if conf < 0.75 else "#4c4")
+    hcol2.markdown(
+        f"<div style='margin-top:18px'>"
+        f"<div style='background:#ddd;border-radius:4px;height:10px'>"
+        f"<div style='background:{gc};width:{pct}%;height:10px;border-radius:4px'></div>"
+        f"</div><p style='font-size:11px;color:#888;margin:2px 0 0'>신뢰도 {pct}%</p></div>",
         unsafe_allow_html=True,
     )
 
-    # ── 편집 영역 (접혀있음) ──────────────────────────────────────────────────
-    with st.expander("✏️ 수정하기", expanded=False):
-        show_chord_section(m, validated_chords, corrections)
-        st.divider()
-        show_note_section(m, layout, raw_notes, rule4_flags, corrections)
+    # 플래그
+    for f in flags:
+        st.warning(f, icon="⚠️")
+
+    # ── 코드 심볼 인라인 편집 ─────────────────────────────────────────────────
+    m_chords = [vc for vc in validated_chords if vc.measure == m]
+    chord_corr = corrections.setdefault("chords", {})
+    if m_chords:
+        c_cols = st.columns([1, 2, 2, 1])
+        c_cols[0].markdown("**코드**")
+        vc = m_chords[0]
+        c_cols[1].markdown(
+            f"`{vc.chord_text}` {_conf_badge(vc.confidence)} "
+            f"{'⚠️' if vc.needs_review else ''}"
+        )
+        new_chord = c_cols[2].text_input(
+            "수정", value=chord_corr.get(str(m), ""),
+            placeholder=vc.chord_text, label_visibility="collapsed",
+            key=f"chord_inline_{m}",
+        )
+        if c_cols[3].button("저장", key=f"chord_save_inline_{m}"):
+            if new_chord.strip():
+                chord_corr[str(m)] = new_chord.strip()
+            else:
+                chord_corr.pop(str(m), None)
+            save_corrections(corrections)
+            st.rerun()
+
+    # ── 오선지 (메인 뷰) ──────────────────────────────────────────────────────
+    notation = render_extracted_notation(
+        m, raw_notes, layout, validated_chords,
+        sys_info.time_signature, anomalies,
+        selected_key=selected_key,
+        width=860,
+    )
+    st.image(notation, use_container_width=True)
+    st.caption("🔴 낮은 confidence  🟡 중간  🟢 높음  &nbsp;|&nbsp; ✕ 이상 탐지된 음표")
+
+    # ── 음표 칩 (파트별, 클릭 → 인라인 편집) ─────────────────────────────────
+    note_corr = corrections.setdefault("notes", {})
+    parts_in_m = sorted({n.part_id for n in raw_notes if n.measure == m})
+
+    for pid in parts_in_m:
+        part_name = layout.parts[int(pid[1:])].name
+        part_notes_raw = [n for n in raw_notes if n.part_id == pid and n.measure == m]
+
+        # corrections가 있으면 그걸 표시, 없으면 원본
+        corr_key = f"{pid}-{m}"
+        if corr_key in note_corr:
+            display_notes = note_corr[corr_key]   # list of dict
+            is_corrected  = True
+        else:
+            display_notes = [
+                {"beat": n.beat, "pitch": n.pitch, "duration": n.duration,
+                 "dots": n.dots, "voice": n.voice,
+                 "tie_start": n.tie_start, "tie_end": n.tie_end,
+                 "confidence": n.confidence}
+                for n in sorted(part_notes_raw, key=lambda n: (n.beat, n.voice))
+            ]
+            is_corrected = False
+
+        corrected_label = " ✏️" if is_corrected else ""
+        st.markdown(f"**{part_name}**{corrected_label}")
+
+        if not display_notes:
+            st.caption("  (쉼표)")
+            continue
+
+        # 음표 칩 행 + [+추가] 버튼
+        n_chips = len(display_notes) + 1
+        chip_cols = st.columns(n_chips)
+
+        for b_idx, nd in enumerate(display_notes):
+            badge_n = _conf_badge(nd.get("confidence", 0.5))
+            dur_sym = _DUR_SYM.get(nd["duration"], "♩")
+            dot_str = "." * nd.get("dots", 0)
+            label   = f"{badge_n} {nd['pitch']}\n{dur_sym}{dot_str}"
+            chip_key = f"{pid}:{b_idx}"
+            is_sel   = (selected_key == chip_key)
+
+            with chip_cols[b_idx]:
+                btn_type = "primary" if is_sel else "secondary"
+                if st.button(label, key=f"chip_{m}_{pid}_{b_idx}",
+                             type=btn_type, use_container_width=True):
+                    if is_sel:
+                        st.session_state.pop(sel_key_state, None)
+                    else:
+                        st.session_state[sel_key_state] = chip_key
+                    st.rerun()
+
+        # [+추가] 버튼
+        with chip_cols[-1]:
+            if st.button("＋", key=f"add_{m}_{pid}", use_container_width=True):
+                st.session_state[sel_key_state] = f"{pid}:new"
+                st.rerun()
+
+        # ── 선택된 음표 인라인 편집 폼 ───────────────────────────────────────
+        if selected_key and selected_key.startswith(f"{pid}:"):
+            suffix = selected_key.split(":", 1)[1]
+            is_new = (suffix == "new")
+            edit_idx = None if is_new else int(suffix)
+
+            with st.container():
+                st.markdown(
+                    f"<div style='background:#eef3ff;border-left:3px solid #4488ee;"
+                    f"padding:8px 12px;margin:4px 0;border-radius:4px'>",
+                    unsafe_allow_html=True,
+                )
+
+                if is_new:
+                    nd = {"beat": 1.0, "pitch": "", "duration": "quarter",
+                          "dots": 0, "voice": 1}
+                else:
+                    nd = display_notes[edit_idx]
+
+                with st.form(key=f"edit_{m}_{pid}_{suffix}"):
+                    ec = st.columns([1.2, 2, 2, 0.7, 0.7, 1, 1])
+                    beat  = ec[0].number_input("박자", value=float(nd["beat"]),
+                                               min_value=0.0, step=0.25,
+                                               label_visibility="collapsed")
+                    pitch = ec[1].text_input("음높이", value=nd["pitch"],
+                                             placeholder="G4, F#5, rest…",
+                                             label_visibility="collapsed")
+                    dur_i = DURATIONS.index(nd["duration"]) if nd["duration"] in DURATIONS else 2
+                    dur   = ec[2].selectbox("음길이", DURATIONS, index=dur_i,
+                                            label_visibility="collapsed")
+                    dots  = ec[3].number_input("점", value=int(nd.get("dots", 0)),
+                                               min_value=0, max_value=2,
+                                               label_visibility="collapsed")
+                    voice = ec[4].number_input("성부", value=int(nd.get("voice", 1)),
+                                               min_value=1, max_value=4,
+                                               label_visibility="collapsed")
+                    save_btn   = ec[5].form_submit_button("💾 저장", use_container_width=True)
+                    delete_btn = ec[6].form_submit_button("🗑️ 삭제", use_container_width=True)
+
+                if save_btn:
+                    new_nd = {"beat": beat, "pitch": pitch.strip(),
+                              "duration": dur, "dots": dots, "voice": voice,
+                              "tie_start": False, "tie_end": False}
+                    updated = list(display_notes)
+                    if is_new:
+                        updated.append(new_nd)
+                    else:
+                        updated[edit_idx] = new_nd
+                    updated.sort(key=lambda x: (x["beat"], x["voice"]))
+                    note_corr[corr_key] = updated
+                    save_corrections(corrections)
+                    st.session_state.pop(sel_key_state, None)
+                    st.cache_data.clear()
+                    st.rerun()
+
+                if delete_btn and not is_new:
+                    updated = [n for i, n in enumerate(display_notes) if i != edit_idx]
+                    note_corr[corr_key] = updated
+                    save_corrections(corrections)
+                    st.session_state.pop(sel_key_state, None)
+                    st.cache_data.clear()
+                    st.rerun()
+
+                st.markdown("</div>", unsafe_allow_html=True)
 
 # ── 메인 ─────────────────────────────────────────────────────────────────────
 
@@ -728,8 +901,8 @@ def main():
             st.rerun()
         st.divider()
 
-    # ── 악보 개요 (시스템별 형광팬 스트립) ──────────────────────────────────
-    st.subheader("악보 개요 — 마디를 클릭해 편집")
+    # ── 마디 선택 (시스템별 버튼 그리드) ────────────────────────────────────
+    st.subheader("마디 선택")
 
     def _show_measure(conf: float) -> bool:
         if view_mode.startswith("🔴 검수"):
@@ -739,42 +912,37 @@ def main():
         return True
 
     for system in layout.systems:
-        page_img  = load_page_img(system.page)
-        strip_img = render_system_strip(page_img, system, conf_map)
-
-        st.image(
-            strip_img,
-            caption=f"p{system.page}  |  m{system.start_measure}–{system.end_measure}"
-                    f"  |  {system.key}  {system.time_signature}",
-            use_container_width=True,
+        st.caption(
+            f"p{system.page}  ·  m{system.start_measure}–{system.end_measure}"
+            f"  ·  {system.key}  {system.time_signature}"
         )
+        n_m  = system.end_measure - system.start_measure + 1
+        cols = st.columns(n_m)
 
-        # 마디 버튼 행
-        n_m   = system.end_measure - system.start_measure + 1
-        cols  = st.columns(n_m)
         for i, m in enumerate(range(system.start_measure, system.end_measure + 1)):
             conf  = conf_map.get(m, 1.0)
             badge = _conf_badge(conf)
 
             if not _show_measure(conf):
-                # 필터 밖 마디: 번호만 표시 (회색)
                 cols[i].markdown(
-                    f"<p style='text-align:center;color:#aaa;font-size:11px;"
-                    f"margin:0;padding:0'>m{m}</p>",
+                    f"<p style='text-align:center;color:#ccc;font-size:11px;"
+                    f"margin:2px 0'>m{m}</p>",
                     unsafe_allow_html=True,
                 )
                 continue
 
             is_selected = (selected_m == m)
-            label = f"{badge} {m}" + (" ◀" if is_selected else "")
-            if cols[i].button(label, key=f"mbtn_{m}", use_container_width=True):
+            label = f"{badge}{m}" + (" ◀" if is_selected else "")
+            btn_type = "primary" if is_selected else "secondary"
+            if cols[i].button(label, key=f"mbtn_{m}",
+                              type=btn_type, use_container_width=True):
                 if is_selected:
                     st.session_state.pop("selected_measure", None)
                 else:
                     st.session_state["selected_measure"] = m
                 st.rerun()
 
-        st.markdown("")   # 시스템 간 간격
+        st.markdown("")
 
 
 if __name__ == "__main__":
