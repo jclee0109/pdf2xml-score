@@ -141,7 +141,186 @@ def measure_confidence(
 
     return conf, flags
 
-# ── 이미지 렌더링 ─────────────────────────────────────────────────────────────
+# ── 생성본 오선보 렌더링 ──────────────────────────────────────────────────────
+
+_STEP_NUM = {'C': 0, 'D': 1, 'E': 2, 'F': 3, 'G': 4, 'A': 5, 'B': 6}
+
+# 클레프별 하단 기준 음표 (= 오선 1번 선)
+_CLEF_BASE: dict[str, int] = {
+    "treble": 4 * 7 + 2,   # E4 절대 다이아토닉 위치
+    "bass":   2 * 7 + 4,   # G2
+    "alto":   3 * 7 + 2,   # E3
+    "tenor":  3 * 7 + 4,   # G3
+}
+
+def _pitch_staff_pos(pitch: str, clef: str = "treble") -> float | None:
+    """pitch ('G4', 'F#5', 'rest') → 오선 위치 (0=하단선, 4=상단선, 소수=공간)."""
+    if pitch == "rest" or not pitch:
+        return None
+    step = pitch[0].upper()
+    rest = pitch[1:]
+    if rest and rest[0] in ('#', 'b'):
+        rest = rest[1:]
+    try:
+        octave = int(rest)
+    except ValueError:
+        return None
+    abs_d = octave * 7 + _STEP_NUM.get(step, 0)
+    base  = _CLEF_BASE.get(clef, _CLEF_BASE["treble"])
+    return (abs_d - base) * 0.5
+
+
+def _note_color(conf: float) -> tuple[int, int, int]:
+    if conf < 0.50: return (210, 50, 50)
+    if conf < 0.75: return (210, 160, 0)
+    return (50, 170, 80)
+
+
+def render_extracted_notation(
+    m: int,
+    raw_notes: list[RawNote],
+    layout: ScoreLayout,
+    validated_chords: list[ValidatedChord],
+    time_sig: str,
+    anomalies: dict[tuple[str, int], list[str]],
+    width: int = 600,
+) -> Image.Image:
+    """마디 m의 추출된 음표를 오선보로 렌더링.
+
+    - 음표 색상: 🔴 conf<0.5 / 🟡 0.5~0.75 / 🟢 ≥0.75
+    - 플래그된 음표에 ✕ 마크
+    - 파트별 오선 스택
+    - 코드 심볼 상단 표시
+    """
+    # 이 마디의 파트 목록 (음표 있는 것만)
+    m_notes = [n for n in raw_notes if n.measure == m and n.pitch != "rest"]
+    parts_with_notes = sorted({n.part_id for n in m_notes})
+
+    # 코드 심볼
+    chord_texts = [vc.chord_text for vc in validated_chords if vc.measure == m]
+    chord_label = " / ".join(chord_texts) if chord_texts else ""
+
+    # 이상 플래그 (파트 무관 메시지)
+    all_anom_msgs: list[str] = []
+    for (pid, mm), msgs in anomalies.items():
+        if mm == m:
+            all_anom_msgs.extend(msgs)
+
+    # ── 레이아웃 상수 ──────────────────────────────────────────────────────────
+    MARGIN_L   = 55
+    MARGIN_R   = 20
+    LS         = 10          # line spacing (px)
+    STAFF_H    = 4 * LS      # 5선 높이
+    NOTE_RX    = 5           # 음표 머리 가로 반지름
+    NOTE_RY    = 4           # 음표 머리 세로 반지름
+    PART_GAP   = 30          # 파트 간 간격
+    HEADER_H   = 40          # 상단 코드/제목 영역
+    FLAG_H     = max(0, len(all_anom_msgs) * 16 + 8)
+
+    n_staves = max(len(parts_with_notes), 1)
+    total_h  = HEADER_H + n_staves * (STAFF_H + PART_GAP) + FLAG_H + 10
+
+    img  = Image.new("RGB", (width, total_h), (255, 255, 255))
+    draw = ImageDraw.Draw(img)
+
+    # ── 코드 심볼 ─────────────────────────────────────────────────────────────
+    if chord_label:
+        draw.text((MARGIN_L, 8), chord_label, fill=(50, 50, 180))
+
+    # ── 박자 → x 변환 ─────────────────────────────────────────────────────────
+    beats_num, beat_type = time_sig.split("/")
+    beats_per_m = int(beats_num) * 4.0 / int(beat_type)
+    staff_w = width - MARGIN_L - MARGIN_R
+
+    def beat_x(beat: float) -> int:
+        ratio = max(0.0, min(1.0, (beat - 1.0) / beats_per_m))
+        return int(MARGIN_L + 15 + ratio * (staff_w - 20))
+
+    # ── 파트별 오선 그리기 ─────────────────────────────────────────────────────
+    for s_idx, pid in enumerate(parts_with_notes):
+        part      = layout.parts[int(pid[1:])]
+        clef      = part.clef
+        staff_top = HEADER_H + s_idx * (STAFF_H + PART_GAP)
+        staff_bot = staff_top + STAFF_H
+
+        # 오선 5개
+        for li in range(5):
+            ly = staff_bot - li * LS
+            draw.line([(MARGIN_L, ly), (width - MARGIN_R, ly)], fill=(180, 180, 180), width=1)
+
+        # 파트명 (작게)
+        draw.text((2, staff_top + LS), part.name[:12], fill=(120, 120, 120))
+
+        # 클레프 기호 (단순 텍스트)
+        clef_char = {"treble": "𝄞", "bass": "𝄢", "alto": "𝄡", "tenor": "𝄡"}.get(clef, "𝄞")
+        draw.text((MARGIN_L - 18, staff_top - 2), clef_char, fill=(80, 80, 80))
+
+        # 이 파트의 이마디 음표
+        part_notes = [n for n in m_notes if n.part_id == pid]
+
+        # beat별 묶기 (화음)
+        by_beat: dict[float, list[RawNote]] = {}
+        for n in part_notes:
+            by_beat.setdefault(round(n.beat, 3), []).append(n)
+
+        for beat, chord_notes in sorted(by_beat.items()):
+            x = beat_x(beat)
+
+            for n in chord_notes:
+                pos = _pitch_staff_pos(n.pitch, clef)
+                if pos is None:
+                    continue
+
+                y = staff_bot - int(pos * LS)
+
+                # 올려 긋기선 (오선 밖 음표)
+                for ledger_pos in range(0, int(pos * 2) - 1, -2):
+                    if ledger_pos % 2 == 0:
+                        ly = staff_bot - int(ledger_pos / 2 * LS)
+                        draw.line([(x - 9, ly), (x + 9, ly)], fill=(160, 160, 160), width=1)
+                for ledger_pos in range(10, int(pos * 2) + 2, 2):
+                    if ledger_pos % 2 == 0:
+                        ly = staff_bot - int(ledger_pos / 2 * LS)
+                        draw.line([(x - 9, ly), (x + 9, ly)], fill=(160, 160, 160), width=1)
+
+                # 음표 머리
+                color = _note_color(n.confidence)
+                draw.ellipse(
+                    [(x - NOTE_RX, y - NOTE_RY), (x + NOTE_RX, y + NOTE_RY)],
+                    fill=color, outline=(0, 0, 0), width=1,
+                )
+
+                # 이상 플래그된 음표 → ✕ 마크
+                if (pid, m) in anomalies:
+                    draw.line([(x - 6, y - 6), (x + 6, y + 6)], fill=(180, 0, 0), width=2)
+                    draw.line([(x + 6, y - 6), (x - 6, y + 6)], fill=(180, 0, 0), width=2)
+
+        # 쉼표 마디 (음표 없음) 표시
+        if not part_notes:
+            mid_y = staff_top + STAFF_H // 2
+            draw.rectangle(
+                [(width // 2 - 15, mid_y - 4), (width // 2 + 15, mid_y + 2)],
+                fill=(180, 180, 180),
+            )
+
+    # ── 플래그 설명 ──────────────────────────────────────────────────────────
+    flag_y = HEADER_H + n_staves * (STAFF_H + PART_GAP)
+    for msg in all_anom_msgs:
+        color = (180, 0, 0) if "Rule 7" in msg else (160, 100, 0)
+        draw.text((MARGIN_L, flag_y), f"⚠ {msg}", fill=color)
+        flag_y += 16
+
+    # ── 신뢰도 범례 (우하단) ─────────────────────────────────────────────────
+    legend_x, legend_y = width - 130, total_h - 22
+    for label, color, cval in [("낮음", (210,50,50), 0.3), ("중간", (210,160,0), 0.6), ("높음", (50,170,80), 0.9)]:
+        draw.ellipse([(legend_x, legend_y+2), (legend_x+8, legend_y+10)], fill=color)
+        draw.text((legend_x + 12, legend_y), label, fill=(100, 100, 100))
+        legend_x += 42
+
+    return img
+
+
+# ── 원본 이미지 렌더링 ─────────────────────────────────────────────────────────
 
 def _measure_x(system: SystemInfo, m: int, img_w: int) -> tuple[int, int]:
     n   = system.end_measure - system.start_measure + 1
@@ -411,6 +590,7 @@ def show_detail_panel(
     conf_map: dict[int, float],
     flag_map: dict[int, list[str]],
     corrections: dict,
+    anomalies: dict[tuple[str, int], list[str]],
 ) -> None:
     sys = next((s for s in layout.systems
                 if s.start_measure <= m <= s.end_measure), None)
@@ -423,31 +603,43 @@ def show_detail_panel(
 
     st.markdown(f"## {badge} 마디 {m} &nbsp; `{sys.key}` &nbsp; `{sys.time_signature}`")
 
-    for f in flags:
-        st.warning(f, icon="⚠️")
+    # ── 플래그 요약 ──────────────────────────────────────────────────────────
+    if flags:
+        for f in flags:
+            st.warning(f, icon="⚠️")
 
-    col_img, col_edit = st.columns([1, 2], gap="large")
+    # ── 좌: 원본 | 우: 생성본 ────────────────────────────────────────────────
+    col_orig, col_gen = st.columns([1, 1], gap="large")
 
-    with col_img:
+    with col_orig:
+        st.caption("📄 원본")
         page_img = load_page_img(sys.page)
         crop     = render_measure_crop(page_img, sys, m, conf)
-        # 크롭이 너무 가늘면 높이 확장해서 표시
         if crop.height < 80:
             scale = max(1, 80 // crop.height)
             crop  = crop.resize((crop.width * scale, crop.height * scale), Image.NEAREST)
-        st.image(crop, caption=f"m{m} 크롭 (p{sys.page})", use_container_width=True)
+        st.image(crop, use_container_width=True)
 
-        # 신뢰도 게이지
-        pct = int(conf * 100)
-        color = "#e55" if conf < 0.5 else ("#fa0" if conf < 0.75 else "#4c4")
-        st.markdown(
-            f"<div style='background:#ddd;border-radius:4px;height:10px;margin-top:6px'>"
-            f"<div style='background:{color};width:{pct}%;height:10px;border-radius:4px'></div>"
-            f"</div><p style='font-size:12px;color:#888;margin:2px 0'>신뢰도 {pct}%</p>",
-            unsafe_allow_html=True,
+    with col_gen:
+        st.caption("🎵 추출된 악보 (confidence 색상: 🔴낮음 🟡중간 🟢높음)")
+        notation = render_extracted_notation(
+            m, raw_notes, layout, validated_chords,
+            sys.time_signature, anomalies,
         )
+        st.image(notation, use_container_width=True)
 
-    with col_edit:
+    # 신뢰도 게이지 (한 줄)
+    pct   = int(conf * 100)
+    color = "#e55" if conf < 0.5 else ("#fa0" if conf < 0.75 else "#4c4")
+    st.markdown(
+        f"<div style='background:#ddd;border-radius:4px;height:8px;margin:6px 0 2px'>"
+        f"<div style='background:{color};width:{pct}%;height:8px;border-radius:4px'></div>"
+        f"</div><p style='font-size:11px;color:#888;margin:0'>신뢰도 {pct}%</p>",
+        unsafe_allow_html=True,
+    )
+
+    # ── 편집 영역 (접혀있음) ──────────────────────────────────────────────────
+    with st.expander("✏️ 수정하기", expanded=False):
         show_chord_section(m, validated_chords, corrections)
         st.divider()
         show_note_section(m, layout, raw_notes, rule4_flags, corrections)
@@ -529,6 +721,7 @@ def main():
         show_detail_panel(
             selected_m, layout, raw_notes, validated,
             rule4_flags, conf_map, flag_map, corrections,
+            anomalies,
         )
         if st.button("✕ 닫기", key="close_detail"):
             st.session_state.pop("selected_measure", None)
