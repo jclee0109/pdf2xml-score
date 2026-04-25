@@ -18,7 +18,7 @@ from src.pipeline.pass2b import notes_from_json
 from src.pipeline.pass2c import lyrics_from_json
 from src.pipeline.pass3 import (
     validate_chords, validate_notes, ValidatedChord,
-    DURATION_QUARTERS, _time_sig_quarters,
+    DURATION_QUARTERS, _time_sig_quarters, check_note_anomalies,
 )
 from src.models.score import RawNote, SystemInfo, ScoreLayout
 
