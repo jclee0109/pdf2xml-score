@@ -18,7 +18,7 @@ from src.pipeline.pass2b import notes_from_json
 from src.pipeline.pass2c import lyrics_from_json
 from src.pipeline.pass3 import (
     validate_chords, validate_notes, ValidatedChord,
-    DURATION_QUARTERS, _time_sig_quarters, check_note_anomalies,
+    DURATION_QUARTERS, _time_sig_quarters,
 )
 from src.models.score import RawNote, SystemInfo, ScoreLayout
 
@@ -113,6 +113,13 @@ def measure_confidence(
             conf = min(conf, vc.confidence)
             flags.append(f"코드 `{vc.chord_text}` — {vc.confidence:.0%}")
 
+    m_notes = [n for n in raw_notes if n.measure == m and n.pitch != "rest"]
+    if m_notes:
+        mn = min(n.confidence for n in m_notes)
+        if mn < 0.70:
+            conf = min(conf, mn)
+            flags.append(f"음표 신뢰도 {mn:.0%}")
+
     # Rule 4: 박자 불일치
     bad_parts = [pid for (pid, mm) in rule4_flags if mm == m]
     if bad_parts:
@@ -185,20 +192,8 @@ def save_corrections(c: dict) -> None:
 
 # ── MusicXML 재생성 ───────────────────────────────────────────────────────────
 
-
-def estimate_measure_x_ratio(measure: int, system: SystemInfo) -> float:
-    """마디 번호 → 시스템 내 x 위치 비율 (균등 추정)."""
-    total = system.end_measure - system.start_measure + 1
-    idx   = measure - system.start_measure
-    return (idx + 0.5) / total
-
-
-# ── 파이프라인 재실행 ─────────────────────────────────────────────────────────
-
-def rebuild_musicxml(corrections: dict[str, str]) -> str:
-    from src.pipeline.pass2b import notes_from_json
-    from src.pipeline.pass2c import lyrics_from_json
-    from src.pipeline.pass3 import validate_notes
+def rebuild_musicxml(corrections: dict) -> str:
+    from src.pipeline.pass3 import ValidatedChord as VC
     from src.pipeline.build import build_musicxml
     from src.models.chord import parse_chord_text
 
@@ -236,13 +231,12 @@ def rebuild_musicxml(corrections: dict[str, str]) -> str:
                 part_id=pid, source_system=0,
             ))
 
-    notes_path  = OUTPUT_DIR / "pass2b_notes.json"
-    lyrics_path = OUTPUT_DIR / "pass2c_lyrics.json"
-    raw_notes   = notes_from_json(notes_path)   if notes_path.exists()  else []
-    raw_lyrics  = lyrics_from_json(lyrics_path) if lyrics_path.exists() else []
-    raw_notes   = validate_notes(raw_notes, layout)
+    for n in raw_notes:
+        if (n.part_id, n.measure) not in replaced:
+            corrected_notes.append(n)
 
-    xml_bytes = build_musicxml(layout, corrected, raw_notes, raw_lyrics or None)
+    corrected_notes = validate_notes(corrected_notes, layout)
+    xml_bytes = build_musicxml(layout, corrected_chords, corrected_notes, raw_lyrics or None)
     out_path  = OUTPUT_DIR / "output.musicxml"
     out_path.write_bytes(xml_bytes)
     return str(out_path)
