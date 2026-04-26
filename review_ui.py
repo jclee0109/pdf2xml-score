@@ -352,6 +352,203 @@ def render_extracted_notation(
     return img
 
 
+# ── 시스템 전체 오선보 렌더링 ────────────────────────────────────────────────────
+
+def render_system_notation(
+    system: SystemInfo,
+    raw_notes: list[RawNote],
+    layout: ScoreLayout,
+    validated_chords: list[ValidatedChord],
+    anomalies: dict[tuple[str, int], list[str]],
+    conf_map: dict[int, float],
+    selected_m: int | None = None,
+    width: int = 1100,
+) -> Image.Image:
+    """시스템(한 줄 = 여러 마디) 전체를 하나의 오선보 이미지로 렌더링.
+
+    - 원본과 같은 행 단위 레이아웃
+    - 음표 음역에 따라 오선 위/아래 공간 동적 확장 (overflow 방지)
+    - 마디별 confidence 배경 tint
+    - 선택 마디: 파란 외곽선 강조
+    """
+    measures  = list(range(system.start_measure, system.end_measure + 1))
+    n_m       = len(measures)
+    sys_notes = [n for n in raw_notes
+                 if system.start_measure <= n.measure <= system.end_measure]
+
+    # 음표 있는 파트만
+    parts_in_sys = sorted({n.part_id for n in sys_notes if n.pitch != "rest"})
+
+    # ── 상수 ────────────────────────────────────────────────────────────────
+    ML   = 82   # left margin (part name + clef)
+    MR   = 8    # right margin
+    LS   = 12   # line spacing (px per staff position step)
+    MNUM_H = 18  # measure number header height
+    PAD  = 6    # vertical padding between stave area and boundary
+
+    measure_w = (width - ML - MR) / max(n_m, 1)
+
+    # ── 파트별 음역 계산 → 동적 높이 ────────────────────────────────────────
+    part_info: list[dict] = []
+    for pid in parts_in_sys:
+        part  = layout.parts[int(pid[1:])]
+        clef  = part.clef
+        p_notes = [n for n in sys_notes if n.part_id == pid and n.pitch != "rest"]
+        poss = [_pitch_staff_pos(n.pitch, clef) for n in p_notes]
+        poss = [p for p in poss if p is not None]
+
+        if poss:
+            low  = min(poss)
+            high = max(poss)
+        else:
+            low, high = 0.0, 4.0
+
+        # 오선 영역(0~4) + 음표 범위에 맞춰 여백 추가 (최대 4칸 = 4개 올림줄)
+        below = max(0.0, -low + 0.5)      # 오선 아래 추가 (clamp 4)
+        above = max(0.0, high - 4 + 0.5)  # 오선 위 추가
+        below = min(below, 4.0)
+        above = min(above, 4.0)
+
+        stave_h = int((4 + below + above) * LS) + PAD * 2
+        part_info.append({
+            "pid": pid, "clef": clef, "name": part.name,
+            "below": below, "above": above, "stave_h": stave_h,
+        })
+
+    PART_GAP = 14
+    total_h  = MNUM_H + sum(pi["stave_h"] + PART_GAP for pi in part_info) + 10
+
+    img  = Image.new("RGB", (width, total_h), (253, 253, 253))
+    draw = ImageDraw.Draw(img)
+
+    # ── 마디별 배경 tint + 마디 번호 ─────────────────────────────────────────
+    for i, m in enumerate(measures):
+        x1 = ML + i * measure_w
+        x2 = x1 + measure_w - 1
+        conf = conf_map.get(m, 1.0)
+
+        # 매우 연한 confidence tint
+        r, g, b, _ = _conf_rgba(conf)
+        tint = (int(r * 0.08 + 253 * 0.92),
+                int(g * 0.08 + 253 * 0.92),
+                int(b * 0.08 + 253 * 0.92))
+        draw.rectangle([(x1, 0), (x2, total_h)], fill=tint)
+
+        # 선택 마디: 파란 테두리
+        if m == selected_m:
+            draw.rectangle([(x1 + 1, 1), (x2 - 1, total_h - 2)],
+                           outline=(60, 120, 220), width=2)
+
+        # 마디 번호
+        m_label = f"m{m}"
+        badge   = _conf_badge(conf)
+        draw.text((int(x1 + 4), 3), f"{badge}{m_label}", fill=(90, 90, 110))
+
+    # 왼쪽 경계선
+    draw.rectangle([(0, 0), (ML - 1, total_h)], fill=(245, 245, 248))
+
+    # ── 파트별 오선 + 음표 ────────────────────────────────────────────────────
+    y_cur = MNUM_H
+    for pi in part_info:
+        pid   = pi["pid"]
+        clef  = pi["clef"]
+        below = pi["below"]
+        above = pi["above"]
+        stave_h = pi["stave_h"]
+
+        # 오선 1번 선(하단) y 좌표
+        staff_bot = y_cur + PAD + int((below) * LS) + 4 * LS
+        staff_top = staff_bot - 4 * LS
+
+        # 파트명
+        draw.text((2, staff_bot - 2 * LS), pi["name"][:13], fill=(100, 100, 100))
+
+        # 오선 5개
+        for li in range(5):
+            ly = staff_bot - li * LS
+            lw = 1 if li != 2 else 2
+            draw.line([(ML, ly), (width - MR, ly)], fill=(155, 155, 165), width=lw)
+
+        # 좌측 바라인
+        draw.line([(ML, staff_top), (ML, staff_bot)], fill=(60, 60, 60), width=2)
+
+        # 마디 바라인 (오른쪽)
+        for i in range(n_m):
+            bx = int(ML + (i + 1) * measure_w)
+            draw.line([(bx, staff_top), (bx, staff_bot)], fill=(120, 120, 120), width=1)
+
+        # ── 음표 그리기 ────────────────────────────────────────────────────
+        p_notes = [n for n in sys_notes if n.part_id == pid]
+        by_m_beat: dict[tuple[int, float], list[RawNote]] = {}
+        for n in p_notes:
+            key = (n.measure, round(n.beat, 3))
+            by_m_beat.setdefault(key, []).append(n)
+
+        beats_num, beat_type = system.time_signature.split("/")
+        beats_per_m = int(beats_num) * 4.0 / int(beat_type)
+
+        for (m_num, beat), chord_notes in sorted(by_m_beat.items()):
+            m_idx = m_num - system.start_measure
+            x_m_start = ML + m_idx * measure_w
+            beat_ratio = max(0.0, min(1.0, (beat - 1.0) / beats_per_m))
+            x = int(x_m_start + 8 + beat_ratio * (measure_w - 14))
+
+            for n in chord_notes:
+                if n.pitch == "rest":
+                    # 쉼표: 가는 사각형
+                    draw.rectangle(
+                        [(x - 6, staff_bot - 2 * LS - 2),
+                         (x + 6, staff_bot - 2 * LS + 2)],
+                        fill=(180, 180, 190),
+                    )
+                    continue
+
+                pos = _pitch_staff_pos(n.pitch, clef)
+                if pos is None:
+                    continue
+
+                # 오선 범위 초과 시 클리핑 표시 (화살표)
+                clamped = False
+                if pos < -below - 0.5:
+                    pos = -below - 0.1
+                    clamped = True
+                elif pos > 4 + above + 0.5:
+                    pos = 4 + above + 0.1
+                    clamped = True
+
+                y = int(staff_bot - pos * LS)
+                color = _note_color(n.confidence)
+
+                # 올려 긋기선
+                for lp in range(-2, int(pos * 2) - 1, -2):
+                    if lp < -int(below * 2 + 0.5):
+                        break
+                    ly = staff_bot - int(lp / 2 * LS)
+                    draw.line([(x - 9, ly), (x + 9, ly)], fill=(150, 150, 155), width=1)
+                for lp in range(10, int(pos * 2) + 2, 2):
+                    if lp > int((4 + above) * 2 + 0.5):
+                        break
+                    ly = staff_bot - int(lp / 2 * LS)
+                    draw.line([(x - 9, ly), (x + 9, ly)], fill=(150, 150, 155), width=1)
+
+                NRX, NRY = 6, 4
+                if clamped:
+                    draw.polygon([(x, y - 7), (x - 5, y + 1), (x + 5, y + 1)],
+                                 fill=color, outline=(80, 80, 80))
+                else:
+                    draw.ellipse([(x - NRX, y - NRY), (x + NRX, y + NRY)],
+                                 fill=color, outline=(30, 30, 30), width=1)
+
+                # 이상 플래그 ✕
+                if (pid, m_num) in anomalies:
+                    draw.line([(x - 7, y - 7), (x + 7, y + 7)], fill=(180, 0, 0), width=2)
+                    draw.line([(x + 7, y - 7), (x - 7, y + 7)], fill=(180, 0, 0), width=2)
+
+        y_cur += stave_h + PART_GAP
+
+    return img
+
+
 # ── 원본 이미지 렌더링 ─────────────────────────────────────────────────────────
 
 def _measure_x(system: SystemInfo, m: int, img_w: int) -> tuple[int, int]:
