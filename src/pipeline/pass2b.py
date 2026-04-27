@@ -508,7 +508,30 @@ def _extract_parts_individually(
 
         mxl = _run_batch(crop_path, cache_dir, timeout=120)
         if mxl is None:
-            log.warning(f"  strip {s_start}~{s_end} 실패")
+            # strip 실패 → 패밀리 경계 가로지름 가능성. 파트 1개씩 재시도
+            log.info(f"  strip {s_start}~{s_end} 실패 → 개별 파트 재시도")
+            for i, pid in enumerate(strip_pids):
+                part_stem = f"part_{pid}_p{system.page}"
+                p_crop = crop_part_range(
+                    page_img,
+                    system.y_top_px, system.y_bottom_px,
+                    s_start + i, s_start + i, n_parts,
+                )
+                pw, ph = p_crop.size
+                if pw * ph == 0:
+                    continue
+                p_scale = min(5.0, (_AUDIVERIS_MAX_PX / (pw * ph)) ** 0.5)
+                if p_scale > 1.05:
+                    p_crop = p_crop.resize(
+                        (int(pw * p_scale), int(ph * p_scale)), _Image.LANCZOS
+                    )
+                p_path = cache_dir / f"{part_stem}.png"
+                if not p_path.exists():
+                    p_crop.save(p_path)
+                p_mxl = _run_batch(p_path, cache_dir, timeout=90)
+                if p_mxl:
+                    part_notes = _parse_mxl(p_mxl, start_measure, 1, end_measure=end_measure)
+                    result[pid] = part_notes.get(0, [])
             continue
 
         strip_notes = _parse_mxl(mxl, start_measure, n_strip_parts, end_measure=end_measure)

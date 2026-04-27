@@ -129,7 +129,9 @@ def _parse_mxl(
                     div_el = child.find("divisions")
                     if div_el is not None:
                         try:
-                            divisions = int(div_el.text)
+                            d = int(div_el.text)
+                            if d > 0:
+                                divisions = d
                         except (ValueError, TypeError):
                             pass
 
