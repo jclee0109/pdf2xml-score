@@ -444,3 +444,90 @@ def run_pass2b(
 
     log.info(f"Pass 2b 완료: 총 {len(all_raw)}개 음표")
     return all_raw
+
+
+# ── Audiveris 경로 ────────────────────────────────────────────────────────────
+
+def run_pass2b_audiveris(
+    page_img_paths: list[str],
+    layout: ScoreLayout,
+    cache_dir: str | Path = "output/.audiveris_cache",
+) -> list[RawNote]:
+    """Audiveris로 전체 음표 추출.
+
+    페이지 단위로 Audiveris를 실행하고, 파트 위치(인덱스)로 ScoreLayout에 매핑.
+    Piano 파트가 있어도 Audiveris로 통합 처리 (오케스트라 + 피아노 혼합 악보 지원).
+
+    Args:
+        page_img_paths: 이미 저장된 페이지 PNG 경로 목록 (page-01.png, ...)
+        layout: ScoreLayout
+        cache_dir: Audiveris 결과 캐시 디렉토리
+    """
+    from ..utils.audiveris import extract_notes_page, is_available
+
+    if not is_available():
+        log.error("Audiveris 미설치 — /Applications/Audiveris.app 필요")
+        return []
+
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    # 페이지별 시스템 그루핑 (1-based page number)
+    page_to_systems: dict[int, list[SystemInfo]] = {}
+    for s in layout.systems:
+        page_to_systems.setdefault(s.page, []).append(s)
+
+    all_raw: list[RawNote] = []
+    processed_pages: set[int] = set()
+
+    for page_num in sorted(page_to_systems):
+        systems_on_page = page_to_systems[page_num]
+        img_path = page_img_paths[page_num - 1]
+
+        # 페이지 첫 시스템 기준으로 start_measure 결정
+        first_sys = min(systems_on_page, key=lambda s: s.start_measure)
+        active_parts = first_sys.active_parts
+
+        log.info(
+            f"Pass 2b [Audiveris]: p{page_num} "
+            f"m{first_sys.start_measure}~{systems_on_page[-1].end_measure} "
+            f"({len(active_parts)}파트)"
+        )
+
+        by_part = extract_notes_page(
+            img_path=img_path,
+            start_measure=first_sys.start_measure,
+            active_part_ids=active_parts,
+            cache_dir=cache_dir,
+        )
+
+        if by_part is None:
+            log.warning(f"  → Audiveris 실패: p{page_num}")
+            continue
+
+        n_notes = sum(len(v) for v in by_part.values())
+        log.info(f"  → {n_notes}개 음표")
+
+        for pid, note_dicts in by_part.items():
+            part_idx = int(pid[1:])
+            part = layout.parts[part_idx]
+            source_sys = first_sys.system_index
+            for nd in note_dicts:
+                all_raw.append(RawNote(
+                    measure=nd["measure"],
+                    beat=nd["beat"],
+                    pitch=nd["pitch"],
+                    duration=nd["duration"],
+                    dots=nd["dots"],
+                    tie_start=nd["tie_start"],
+                    tie_end=nd["tie_end"],
+                    voice=nd["voice"],
+                    confidence=nd["confidence"],
+                    part_id=pid,
+                    source_system=source_sys,
+                ))
+
+        processed_pages.add(page_num)
+
+    log.info(f"Pass 2b [Audiveris] 완료: {len(processed_pages)}페이지, 총 {len(all_raw)}개 음표")
+    return all_raw

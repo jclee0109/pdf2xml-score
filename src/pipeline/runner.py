@@ -7,7 +7,7 @@ from ..models.score import ScoreDocument, PipelineStatus
 from ..utils.render import render_pdf, load_image
 from .pass1 import run_pass1, layout_from_json, layout_to_json
 from .pass2a import run_pass2a, chords_from_json, chords_to_json
-from .pass2b import run_pass2b, notes_from_json, notes_to_json
+from .pass2b import run_pass2b, run_pass2b_audiveris, notes_from_json, notes_to_json
 from .pass2c import run_pass2c, lyrics_from_json, lyrics_to_json
 from .pass3 import validate_chords, validate_notes
 from .build import build_musicxml
@@ -76,7 +76,15 @@ def run_sprint1(pdf_path: str | Path, output_dir: str | Path) -> ScoreDocument:
     chords_to_json(doc.raw_chords, output_dir / "pass2a_chords.json")
     doc.status     = PipelineStatus.PASS2A_DONE
 
-    doc.raw_notes = run_pass2b(page_images, doc.layout)
+    from ..utils.audiveris import is_available as audiveris_available
+    if audiveris_available():
+        doc.raw_notes = run_pass2b_audiveris(
+            [str(p) for p in page_paths],
+            doc.layout,
+            cache_dir=output_dir / ".audiveris_cache",
+        )
+    else:
+        doc.raw_notes = run_pass2b(page_images, doc.layout)
     notes_to_json(doc.raw_notes, output_dir / "pass2b_notes.json")
     doc.status    = PipelineStatus.PASS2B_DONE
 
