@@ -44,7 +44,10 @@ def _run_batch(img_path: Path, out_dir: Path, timeout: int = 180) -> Path | None
 
     out_dir.mkdir(parents=True, exist_ok=True)
     cmd = [
-        str(_JAVA), "-cp", _classpath(), "Audiveris",
+        str(_JAVA),
+        "-Djava.awt.headless=true",   # AWT headless — Dock 아이콘 억제
+        "-Dapple.awt.UIElement=true", # macOS 전용 — Dock 및 앱 전환기에서 숨김
+        "-cp", _classpath(), "Audiveris",
         "-batch", "-export",
         "-output", str(out_dir),
         str(img_path),
