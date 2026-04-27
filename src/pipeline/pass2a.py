@@ -125,6 +125,20 @@ def extract_chords_for_system(
     return chords
 
 
+def chords_to_json(chords: list[RawChord], path: str | Path) -> None:
+    """RawChord 목록을 JSON으로 저장."""
+    import json as _json
+    data = [
+        {
+            "measure": c.measure, "beat": c.beat,
+            "chord_text": c.chord_text, "confidence": c.confidence,
+            "source_page": c.source_page, "source_system": c.source_system,
+        }
+        for c in chords
+    ]
+    Path(path).write_text(_json.dumps(data, ensure_ascii=False, indent=2))
+
+
 def chords_from_json(path: str | Path) -> list[RawChord]:
     """사전 추출된 JSON 파일에서 RawChord 로드."""
     data = json.loads(Path(path).read_text())

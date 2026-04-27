@@ -133,37 +133,70 @@ def detect_staff_systems(img: Image.Image) -> list[dict]:
 
 # ── 3. 마디 시작 번호 ─────────────────────────────────────────────────────────
 
-def detect_measure_start(img: Image.Image, system_y_top: int) -> int:
+def detect_measure_start(img: Image.Image, system_y_top: int, barline_x: int = -1) -> int:
     """
-    시스템 y_top 위 영역에서 첫 마디 번호를 OCR.
-    반환: 마디 번호 (int), 실패 시 1.
+    시스템 y_top 위/주변 영역에서 첫 마디 번호를 OCR.
+    반환: 마디 번호 (int), 실패 시 0.
 
-    마디 번호는 보표 상단에서 약 10-80px 위에 인쇄됨.
+    마디 번호는 시스템 왼쪽 바라인 기준 좌우에 인쇄됨.
+    barline_x를 알면 단어별 x 위치 기반으로 클레프/조표 영역 숫자를 제외.
     """
     gray = _to_gray(img)
     h, w = gray.shape
 
-    # 마디 번호 위치: y_top 직전 60px (헤더 영역 제외)
-    y1 = max(0, system_y_top - 60)
-    y2 = min(h, system_y_top + 15)
+    y1 = max(0, system_y_top - 70)
+    y2 = min(h, system_y_top + 20)
     if y2 <= y1:
-        return 1
+        return 0
 
-    x1 = w // 10   # 악기 이름 일부 포함해도 OK — 숫자만 추출
-    x2 = w // 2
+    if barline_x > 50:
+        # 악기명 영역(barline 왼쪽 멀리)은 제외, 바라인 근처 ±150px 탐색
+        x1 = max(0, barline_x - 150)
+        x2 = min(w, barline_x + 80)
+    else:
+        x1 = 0
+        x2 = w // 3
 
     crop = gray[y1:y2, x1:x2]
-    pil = Image.fromarray(crop)
-    pil = pil.resize((pil.width * 3, pil.height * 3), Image.LANCZOS)
+    if crop.size == 0:
+        return 0
 
-    text = pytesseract.image_to_string(pil, config="--psm 6 --oem 3")
-    # 2자리 이상 숫자 우선 (마디번호는 보통 2-3자리)
-    numbers = re.findall(r"\d+", text)
-    multi = [n for n in numbers if len(n) >= 2]
-    candidates = multi if multi else numbers
-    if candidates:
-        return int(candidates[0])
-    return 1
+    SCALE = 3
+    pil = Image.fromarray(crop).resize(
+        (crop.shape[1] * SCALE, crop.shape[0] * SCALE), Image.LANCZOS
+    )
+
+    data = pytesseract.image_to_data(pil, config="--psm 6 --oem 3",
+                                     output_type=pytesseract.Output.DICT)
+
+    # 바라인 직후(클레프 시작) 이후 단어는 제외
+    # crop 내 x 한계 = (barline_x - x1 + 20) * SCALE
+    if barline_x > 50:
+        x_limit = (barline_x - x1 + 20) * SCALE
+    else:
+        x_limit = pil.width
+
+    candidates: list[int] = []
+    for i, word in enumerate(data["text"]):
+        word = word.strip()
+        if not word:
+            continue
+        wx = data["left"][i]
+        if wx > x_limit:
+            continue
+        # 단어 앞에 붙은 숫자열만 추출 ("100p4" → "100", "95A" → "95")
+        m = re.match(r"^(\d+)", word)
+        if not m:
+            continue
+        num = int(m.group(1))
+        if 1 <= num <= 9999:
+            candidates.append(num)
+
+    if not candidates:
+        return 0
+
+    multi = [n for n in candidates if n >= 10]
+    return multi[0] if multi else candidates[0]
 
 
 # ── 4. 보표 x 시작 위치 추정 ──────────────────────────────────────────────────
@@ -382,6 +415,7 @@ def analyze_page(
     """
     gray = _to_gray(img)
     staff_ys = find_staff_line_ys(gray)
+    barline_x, _ = _find_system_barline_x(gray)
     systems = detect_staff_systems(img)
 
     if not systems:
@@ -392,11 +426,11 @@ def analyze_page(
 
     x_start = _find_staff_x_start(gray)
 
-    # 마디 번호: 첫 시스템 위쪽 영역
+    # 마디 번호: 첫 시스템 위쪽 영역 (barline_x 기준으로 crop 범위 최적화)
     if default_measure is not None:
         start_measure = default_measure
     else:
-        start_measure = detect_measure_start(img, systems[0]["y_top"])
+        start_measure = detect_measure_start(img, systems[0]["y_top"], barline_x=barline_x)
 
     # 조표 / 박자표: 첫 번째 보표 기준
     key = detect_key_signature(img, staff_ys, x_start)

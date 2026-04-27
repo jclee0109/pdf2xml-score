@@ -18,8 +18,15 @@ log = logging.getLogger(__name__)
 
 # ── Step 1-A: 악기 목록 (pytesseract OCR) ────────────────────────────────────
 
-def extract_parts(first_page_img: Image.Image) -> list[PartInfo]:
-    raw_parts = extract_instrument_names(first_page_img)
+def extract_parts(page_images: list[Image.Image]) -> list[PartInfo]:
+    """악기 목록 추출. 페이지 1 실패 시 페이지 2-3까지 순서대로 시도."""
+    raw_parts: list[dict] = []
+    for img in page_images[:3]:
+        raw_parts = extract_instrument_names(img)
+        if len(raw_parts) >= 2:
+            break
+        log.debug(f"악기명 OCR 결과 부족({len(raw_parts)}개), 다음 페이지 시도")
+
     if not raw_parts:
         raise RuntimeError("Step 1-A: 악기 목록 OCR 실패 — 왼쪽 여백에서 텍스트를 찾지 못했습니다")
 
@@ -79,6 +86,90 @@ def extract_systems(
     return systems
 
 
+def _repair_measure_sequence(all_systems: list[SystemInfo]) -> None:
+    """OCR 오인식/미감지 마디번호를 앵커 기반 선형 보간으로 보정.
+
+    전략:
+    1. 비율(measures/system)이 타당한 OCR 값만 앵커로 채택 (0.5 ~ 30 범위)
+    2. 앵커 사이는 선형 보간, 앵커 바깥은 평균 비율로 외삽
+    3. 최종 단조 증가 보장
+
+    타당한 비율 범위는 가장 빠른 팝 곡(~8 measures/page) 부터
+    느린 교향곡(~2 measures/page)까지 커버할 수 있게 여유 있게 설정.
+    """
+    if not all_systems:
+        return
+
+    MAX_RATE = 30.0   # measures per system (보수적 상한)
+    MIN_RATE = 0.5    # measures per system (하한)
+    n = len(all_systems)
+
+    # Step 1: 앵커 후보 — 인접한 유효쌍에서 비율 검사
+    non_zero = [(i, s.start_measure) for i, s in enumerate(all_systems)
+                if s.start_measure > 0]
+
+    anchors: list[tuple[int, int]] = []
+    if non_zero:
+        anchors.append(non_zero[0])
+        for j in range(1, len(non_zero)):
+            i2, m2 = non_zero[j]
+            i1, m1 = anchors[-1]
+            dist = i2 - i1
+            rate = (m2 - m1) / dist if dist > 0 else -1
+            if MIN_RATE <= rate <= MAX_RATE:
+                anchors.append((i2, m2))
+            else:
+                log.debug(
+                    f"앵커 제외: p{all_systems[i2].page} m={m2} "
+                    f"(직전 앵커 m={m1}, rate={rate:.1f})"
+                )
+
+    if not anchors:
+        # 앵커가 없으면 순번 사용
+        for i, s in enumerate(all_systems):
+            s.start_measure = i + 1
+        return
+
+    # 평균 비율 (외삽용)
+    if len(anchors) >= 2:
+        total_m = anchors[-1][1] - anchors[0][1]
+        total_i = anchors[-1][0] - anchors[0][0]
+        avg_rate = total_m / total_i if total_i > 0 else 4.0
+    else:
+        avg_rate = 4.0
+
+    # Step 2: 전체 시스템에 보간/외삽 적용
+    for i, sys in enumerate(all_systems):
+        # 앞·뒤 앵커 탐색
+        lo = next(((ai, am) for ai, am in reversed(anchors) if ai <= i), None)
+        hi = next(((ai, am) for ai, am in anchors if ai >= i), None)
+
+        if lo is not None and hi is not None and lo[0] != hi[0]:
+            frac = (i - lo[0]) / (hi[0] - lo[0])
+            est = lo[1] + frac * (hi[1] - lo[1])
+        elif lo is not None:
+            est = lo[1] + (i - lo[0]) * avg_rate
+        elif hi is not None:
+            est = hi[1] - (hi[0] - i) * avg_rate
+        else:
+            est = i + 1
+
+        new_m = max(1, round(est))
+        if new_m != sys.start_measure and sys.start_measure != 0:
+            log.warning(
+                f"마디번호 보정: p{sys.page} s{sys.system_index} "
+                f"{sys.start_measure} → {new_m}"
+            )
+        sys.start_measure = new_m
+
+    # Step 3: 단조 증가 보장
+    prev = 0
+    for sys in all_systems:
+        if sys.start_measure <= prev:
+            sys.start_measure = prev + 1
+        prev = sys.start_measure
+
+
 def _fill_end_measures(all_systems: list[SystemInfo], total_measures: int) -> None:
     """end_measure를 다음 시스템 start - 1로 채운다."""
     for i, sys in enumerate(all_systems):
@@ -89,6 +180,36 @@ def _fill_end_measures(all_systems: list[SystemInfo], total_measures: int) -> No
 
 
 # ── 메인 진입점 ────────────────────────────────────────────────────────────────
+
+def layout_to_json(layout: ScoreLayout, path: str | Path) -> None:
+    """ScoreLayout을 JSON으로 저장."""
+    data = {
+        "parts": [
+            {"id": p.id, "name": p.name, "order": p.order, "clef": p.clef}
+            for p in layout.parts
+        ],
+        "systems": [
+            {
+                "page": s.page,
+                "system_index": s.system_index,
+                "start_measure": s.start_measure,
+                "end_measure": s.end_measure,
+                "key": s.key,
+                "time_signature": s.time_signature,
+                "y_top_px": s.y_top_px,
+                "y_bottom_px": s.y_bottom_px,
+                "active_parts": s.active_parts,
+                "rehearsal_marks": [{"measure": m.measure, "label": m.label} for m in s.rehearsal_marks],
+                "repeat_barlines": [{"measure": m.measure, "type": m.type} for m in s.repeat_barlines],
+                "volta_brackets": [{"start_measure": m.start_measure, "end_measure": m.end_measure, "number": m.number} for m in s.volta_brackets],
+                "key_changes": [{"measure": m.measure, "key": m.key} for m in s.key_changes],
+            }
+            for s in layout.systems
+        ],
+        "total_measures": layout.total_measures,
+    }
+    Path(path).write_text(json.dumps(data, ensure_ascii=False, indent=2))
+
 
 def layout_from_json(path: str | Path) -> ScoreLayout:
     """사전 추출된 JSON 파일에서 ScoreLayout 로드."""
@@ -150,7 +271,7 @@ def layout_from_json(path: str | Path) -> ScoreLayout:
 def run_pass1(page_images: list[Image.Image]) -> ScoreLayout:
     """전체 Pass 1 실행. ScoreLayout 반환."""
     log.info("Pass 1: 악기 목록 추출 (첫 페이지)")
-    parts = extract_parts(page_images[0])
+    parts = extract_parts(page_images)
     name_to_id = {p.name: p.id for p in parts}
     log.info(f"  → {len(parts)}개 파트 감지: {[p.name for p in parts]}")
 
@@ -166,6 +287,8 @@ def run_pass1(page_images: list[Image.Image]) -> ScoreLayout:
             prev_time = systems[0].time_signature
         all_systems.extend(systems)
         log.info(f"  → {len(systems)}개 시스템 감지")
+
+    _repair_measure_sequence(all_systems)
 
     total_measures = all_systems[-1].start_measure + 20 if all_systems else 0
     _fill_end_measures(all_systems, total_measures)

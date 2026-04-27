@@ -5,8 +5,8 @@ from pathlib import Path
 
 from ..models.score import ScoreDocument, PipelineStatus
 from ..utils.render import render_pdf, load_image
-from .pass1 import run_pass1, layout_from_json
-from .pass2a import run_pass2a, chords_from_json
+from .pass1 import run_pass1, layout_from_json, layout_to_json
+from .pass2a import run_pass2a, chords_from_json, chords_to_json
 from .pass2b import run_pass2b, notes_from_json, notes_to_json
 from .pass2c import run_pass2c, lyrics_from_json, lyrics_to_json
 from .pass3 import validate_chords, validate_notes
@@ -69,9 +69,11 @@ def run_sprint1(pdf_path: str | Path, output_dir: str | Path) -> ScoreDocument:
     page_images = [load_image(p) for p in page_paths]
 
     doc.layout = run_pass1(page_images)
+    layout_to_json(doc.layout, output_dir / "pass1_layout.json")
     doc.status = PipelineStatus.PASS1_DONE
 
     doc.raw_chords = run_pass2a(page_images, doc.layout)
+    chords_to_json(doc.raw_chords, output_dir / "pass2a_chords.json")
     doc.status     = PipelineStatus.PASS2A_DONE
 
     doc.raw_notes = run_pass2b(page_images, doc.layout)
