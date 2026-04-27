@@ -199,6 +199,28 @@ def detect_measure_start(img: Image.Image, system_y_top: int, barline_x: int = -
     return multi[0] if multi else candidates[0]
 
 
+# ── 3.5 단일 보표(5선) 그룹 추출 ────────────────────────────────────────────────
+
+def _first_staff_group(staff_ys: list[int], max_line_gap: int = 80) -> list[int]:
+    """staff_ys에서 연속된 5개 라인으로 구성된 첫 번째 보표 그룹 반환.
+
+    오케스트라 악보에서 find_staff_line_ys는 보표 라인을 성기게 잡아
+    staff_ys[:5]가 서로 다른 파트의 라인을 섞어 반환할 수 있다.
+    연속 라인 간격이 max_line_gap 이하인 경우만 같은 보표로 간주.
+
+    Returns: 5개 y좌표 리스트, 없으면 [] 반환.
+    """
+    if len(staff_ys) < 5:
+        return []
+
+    for i in range(len(staff_ys) - 4):
+        group = staff_ys[i:i + 5]
+        # 연속 간격이 모두 max_line_gap 이하인지 확인
+        if all(group[j + 1] - group[j] <= max_line_gap for j in range(4)):
+            return group
+    return []
+
+
 # ── 4. 보표 x 시작 위치 추정 ──────────────────────────────────────────────────
 
 def _find_staff_x_start(gray: np.ndarray) -> int:
@@ -234,16 +256,17 @@ def detect_key_signature(
     """
     gray = _to_gray(img)
 
-    if len(staff_ys) < 5:
+    first5 = _first_staff_group(staff_ys)
+    if not first5:
         return "C major"
 
-    y_top = staff_ys[0]
-    y_bot = staff_ys[4]
+    y_top = first5[0]
+    y_bot = first5[4]
     staff_height = y_bot - y_top
 
     # 보표 라인 제거
     cleaned = gray.copy()
-    for sy in staff_ys[:5]:
+    for sy in first5:
         cleaned[sy - 2:sy + 3, :] = 255
 
     # 조표 영역: 클레프 이후 ~100px, 보표 위아래 margin 포함
@@ -314,10 +337,10 @@ def detect_time_signature(
     """
     gray = _to_gray(img)
 
-    if len(staff_ys) < 5:
+    first5 = _first_staff_group(staff_ys)
+    if not first5:
         return prev_time
 
-    first5 = staff_ys[:5]
     y_top = first5[0]
     y_bot = first5[4]
     staff_height = y_bot - y_top
@@ -327,10 +350,10 @@ def detect_time_signature(
     for sy in first5:
         cleaned[sy - 2:sy + 3, :] = 255
 
-    # 박자표 영역: 클레프+조표 이후 ~80px
+    # 박자표 영역: 클레프+조표 이후 ~80px (margin은 보표 높이의 절반, 최대 100px)
     x1 = x_staff_start + 110
     x2 = min(gray.shape[1], x_staff_start + 220)
-    margin = staff_height // 2
+    margin = min(staff_height // 2, 100)
     y1 = max(0, y_top - margin)
     y2 = min(gray.shape[0], y_bot + margin)
 

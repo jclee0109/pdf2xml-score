@@ -167,6 +167,29 @@ def _parse_mxl(
     return result
 
 
+def extract_time_signature(mxl_path: Path) -> str | None:
+    """Audiveris MusicXML에서 박자표 추출. 없으면 None."""
+    try:
+        with zipfile.ZipFile(mxl_path) as z:
+            xml_name = next(
+                (n for n in z.namelist() if n.endswith(".xml") and "META" not in n),
+                None,
+            )
+            if not xml_name:
+                return None
+            root = ET.fromstring(z.read(xml_name))
+        time_el = root.find(".//time")
+        if time_el is None:
+            return None
+        b = time_el.find("beats")
+        bt = time_el.find("beat-type")
+        if b is not None and bt is not None:
+            return f"{b.text}/{bt.text}"
+    except Exception:
+        pass
+    return None
+
+
 def extract_notes_page(
     img_path: str | Path,
     start_measure: int,
