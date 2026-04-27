@@ -277,12 +277,14 @@ def run_pass1(page_images: list[Image.Image]) -> ScoreLayout:
 
     all_systems: list[SystemInfo] = []
     prev_key, prev_time = "C major", "4/4"
+    first_music_page = True  # 악보가 실제로 있는 첫 페이지에만 m=1 앵커 적용
     for page_num, img in enumerate(page_images, start=1):
         log.info(f"Pass 1: 페이지 {page_num}/{len(page_images)} 시스템 구조 추출")
         systems = extract_systems(img, page_num, name_to_id,
                                   prev_key=prev_key, prev_time=prev_time,
-                                  default_measure=1 if page_num == 1 else None)
+                                  default_measure=1 if first_music_page else None)
         if systems:
+            first_music_page = False  # 이후 페이지는 OCR로 마디번호 결정
             prev_key = systems[0].key
             prev_time = systems[0].time_signature
         all_systems.extend(systems)
