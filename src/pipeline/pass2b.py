@@ -446,6 +446,74 @@ def run_pass2b(
     return all_raw
 
 
+# ── Audiveris 파트별 fallback ─────────────────────────────────────────────────
+
+def _extract_parts_individually(
+    img_path: str,
+    system: "SystemInfo",
+    layout: "ScoreLayout",
+    start_measure: int,
+    end_measure: int,
+    cache_dir: Path,
+) -> dict[str, list[dict]]:
+    """
+    전체 페이지 Audiveris 실패 시 파트별 crop + 업스케일로 개별 처리.
+
+    밀도 높은 악보(21파트 등)에서 보표 간격(interline)이 Audiveris 최소값(~15px)
+    미만일 때 사용. 각 파트를 개별 crop 후 최대 5배 업스케일해 처리.
+    """
+    from ..utils.audiveris import _run_batch, _parse_mxl
+    from ..utils.render import load_image, crop_part_range
+    from PIL import Image as _Image
+
+    _AUDIVERIS_MAX_PX = 18_000_000  # 20M 제한보다 여유 있게 설정
+
+    page_img = load_image(img_path)
+    active_parts = system.active_parts
+    n_parts = len(active_parts)
+    result: dict[str, list[dict]] = {}
+
+    for i, pid in enumerate(active_parts):
+        part_stem = f"part_{pid}_p{system.page}"
+        mxl_cached = cache_dir / f"{part_stem}.mxl"
+
+        if not mxl_cached.exists():
+            # 단일 파트 crop
+            crop = crop_part_range(
+                page_img,
+                system.y_top_px, system.y_bottom_px,
+                i, i, n_parts,
+            )
+            # 최대 업스케일 계산 (Audiveris 20M px 제한 이내)
+            w, h = crop.size
+            pixels = w * h
+            if pixels == 0:
+                continue
+            scale = min(5.0, (_AUDIVERIS_MAX_PX / pixels) ** 0.5)
+            if scale > 1.1:
+                crop = crop.resize(
+                    (int(w * scale), int(h * scale)), _Image.LANCZOS
+                )
+            crop_path = cache_dir / f"{part_stem}.png"
+            crop.save(crop_path)
+        else:
+            crop_path = cache_dir / f"{part_stem}.png"
+
+        mxl = _run_batch(crop_path if crop_path.exists() else cache_dir / f"{part_stem}.png",
+                         cache_dir, timeout=90)
+        if mxl is None:
+            log.debug(f"  파트 {pid} Audiveris 실패")
+            continue
+
+        part_notes = _parse_mxl(mxl, start_measure, 1, end_measure=end_measure)
+        result[pid] = part_notes.get(0, [])
+        log.debug(f"  파트 {pid}: {len(result[pid])}개 음표")
+
+    n_total = sum(len(v) for v in result.values())
+    log.info(f"  → 개별 처리 완료: {len(result)}/{n_parts}파트, {n_total}개 음표")
+    return result
+
+
 # ── Audiveris 경로 ────────────────────────────────────────────────────────────
 
 def run_pass2b_audiveris(
@@ -504,8 +572,19 @@ def run_pass2b_audiveris(
         )
 
         if by_part is None:
-            log.warning(f"  → Audiveris 실패: p{page_num}")
-            continue
+            # 전체 페이지 실패 → 파트별 개별 crop + 업스케일 fallback
+            log.info(f"  → 전체 페이지 실패, 파트별 개별 처리 시도: p{page_num}")
+            by_part = _extract_parts_individually(
+                img_path=img_path,
+                system=first_sys,
+                layout=layout,
+                start_measure=first_sys.start_measure,
+                end_measure=last_sys.end_measure,
+                cache_dir=cache_dir,
+            )
+            if not by_part:
+                log.warning(f"  → 개별 처리도 실패: p{page_num}")
+                continue
 
         n_notes = sum(len(v) for v in by_part.values())
         log.info(f"  → {n_notes}개 음표")

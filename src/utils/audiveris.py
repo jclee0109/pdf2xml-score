@@ -61,7 +61,17 @@ def _run_batch(img_path: Path, out_dir: Path, timeout: int = 180) -> Path | None
     # 타임스탬프 suffix가 붙는 경우 처리 (page-06-20260427T1827.mxl → page-06.mxl)
     candidates = sorted(out_dir.glob(f"{stem}*.mxl"), key=lambda p: p.stat().st_mtime)
     if not candidates:
-        log.warning(f"Audiveris: .mxl 결과 없음 ({img_path.name})")
+        # 로그에서 실패 이유 감지
+        log_candidates = sorted(out_dir.glob(f"{stem}*.log"), key=lambda p: p.stat().st_mtime)
+        reason = ""
+        if log_candidates:
+            try:
+                content = log_candidates[-1].read_text(errors="ignore")
+                if "too low interline" in content:
+                    reason = " (interline too low — 보표 밀도 과다)"
+            except Exception:
+                pass
+        log.warning(f"Audiveris: .mxl 결과 없음 ({img_path.name}){reason}")
         return None
 
     latest = candidates[-1]
