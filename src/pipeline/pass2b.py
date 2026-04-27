@@ -455,62 +455,68 @@ def _extract_parts_individually(
     start_measure: int,
     end_measure: int,
     cache_dir: Path,
+    strip_size: int = 7,
 ) -> dict[str, list[dict]]:
     """
-    전체 페이지 Audiveris 실패 시 파트별 crop + 업스케일로 개별 처리.
+    전체 페이지 Audiveris 실패 시 N파트씩 strip으로 crop + 업스케일해 처리.
 
-    밀도 높은 악보(21파트 등)에서 보표 간격(interline)이 Audiveris 최소값(~15px)
-    미만일 때 사용. 각 파트를 개별 crop 후 최대 5배 업스케일해 처리.
+    파트별(1개씩) 처리는 21파트×8페이지 = 168회 호출이 필요해 비현실적.
+    N파트씩 묶으면 호출 횟수가 1/N으로 줄면서 interline 문제도 해결됨:
+      7파트 strip: 24회 호출, interline 18px (Audiveris 최소 ~15px 초과)
+
+    strip_size: 한 번에 처리할 파트 수. 이미지 크기와 interline을 고려해 7 기본.
     """
     from ..utils.audiveris import _run_batch, _parse_mxl
     from ..utils.render import load_image, crop_part_range
     from PIL import Image as _Image
 
-    _AUDIVERIS_MAX_PX = 18_000_000  # 20M 제한보다 여유 있게 설정
+    _AUDIVERIS_MAX_PX = 18_000_000
 
     page_img = load_image(img_path)
     active_parts = system.active_parts
     n_parts = len(active_parts)
     result: dict[str, list[dict]] = {}
 
-    for i, pid in enumerate(active_parts):
-        part_stem = f"part_{pid}_p{system.page}"
-        mxl_cached = cache_dir / f"{part_stem}.mxl"
+    # N파트씩 strips로 분할
+    strip_starts = list(range(0, n_parts, strip_size))
+    log.info(f"  → strip 모드: {n_parts}파트 / {strip_size} = {len(strip_starts)}개 strip")
 
-        if not mxl_cached.exists():
-            # 단일 파트 crop
+    for s_start in strip_starts:
+        s_end = min(s_start + strip_size - 1, n_parts - 1)
+        n_strip_parts = s_end - s_start + 1
+        strip_pids = active_parts[s_start:s_end + 1]
+        strip_stem = f"strip_p{system.page}_{s_start}_{s_end}"
+
+        if not (cache_dir / f"{strip_stem}.mxl").exists():
             crop = crop_part_range(
                 page_img,
                 system.y_top_px, system.y_bottom_px,
-                i, i, n_parts,
+                s_start, s_end, n_parts,
             )
-            # 최대 업스케일 계산 (Audiveris 20M px 제한 이내)
             w, h = crop.size
             pixels = w * h
             if pixels == 0:
                 continue
-            scale = min(5.0, (_AUDIVERIS_MAX_PX / pixels) ** 0.5)
-            if scale > 1.1:
-                crop = crop.resize(
-                    (int(w * scale), int(h * scale)), _Image.LANCZOS
-                )
-            crop_path = cache_dir / f"{part_stem}.png"
+            scale = min(3.0, (_AUDIVERIS_MAX_PX / pixels) ** 0.5)
+            if scale > 1.05:
+                crop = crop.resize((int(w * scale), int(h * scale)), _Image.LANCZOS)
+
+            crop_path = cache_dir / f"{strip_stem}.png"
             crop.save(crop_path)
         else:
-            crop_path = cache_dir / f"{part_stem}.png"
+            crop_path = cache_dir / f"{strip_stem}.png"
 
-        mxl = _run_batch(crop_path if crop_path.exists() else cache_dir / f"{part_stem}.png",
-                         cache_dir, timeout=90)
+        mxl = _run_batch(crop_path, cache_dir, timeout=120)
         if mxl is None:
-            log.debug(f"  파트 {pid} Audiveris 실패")
+            log.warning(f"  strip {s_start}~{s_end} 실패")
             continue
 
-        part_notes = _parse_mxl(mxl, start_measure, 1, end_measure=end_measure)
-        result[pid] = part_notes.get(0, [])
-        log.debug(f"  파트 {pid}: {len(result[pid])}개 음표")
+        strip_notes = _parse_mxl(mxl, start_measure, n_strip_parts, end_measure=end_measure)
+        for local_idx, pid in enumerate(strip_pids):
+            result[pid] = strip_notes.get(local_idx, [])
 
     n_total = sum(len(v) for v in result.values())
-    log.info(f"  → 개별 처리 완료: {len(result)}/{n_parts}파트, {n_total}개 음표")
+    log.info(f"  → strip 완료: {len(result)}/{n_parts}파트, {n_total}개 음표")
     return result
 
 
