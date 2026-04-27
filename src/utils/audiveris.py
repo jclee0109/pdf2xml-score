@@ -167,6 +167,43 @@ def _parse_mxl(
     return result
 
 
+_FIFTHS_TO_KEY = {
+    0: "C major", 1: "G major", 2: "D major", 3: "A major",
+    4: "E major", 5: "B major", 6: "F# major", 7: "C# major",
+    -1: "F major", -2: "Bb major", -3: "Eb major", -4: "Ab major",
+    -5: "Db major", -6: "Gb major", -7: "Cb major",
+}
+
+
+def extract_key_signature(mxl_path: Path) -> str | None:
+    """Audiveris MusicXML에서 조표 추출. 없으면 None."""
+    try:
+        with zipfile.ZipFile(mxl_path) as z:
+            xml_name = next(
+                (n for n in z.namelist() if n.endswith(".xml") and "META" not in n),
+                None,
+            )
+            if not xml_name:
+                return None
+            root = ET.fromstring(z.read(xml_name))
+        key_el = root.find(".//key")
+        if key_el is None:
+            return None
+        fifths_el = key_el.find("fifths")
+        mode_el = key_el.find("mode")
+        if fifths_el is None:
+            return None
+        fifths = int(fifths_el.text)
+        mode = mode_el.text if mode_el is not None else "major"
+        key = _FIFTHS_TO_KEY.get(fifths)
+        if key and mode == "minor":
+            key = key.replace("major", "minor")
+        return key
+    except Exception:
+        pass
+    return None
+
+
 def extract_time_signature(mxl_path: Path) -> str | None:
     """Audiveris MusicXML에서 박자표 추출. 없으면 None."""
     try:

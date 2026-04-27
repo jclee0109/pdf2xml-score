@@ -125,10 +125,18 @@ def detect_staff_systems(img: Image.Image) -> list[dict]:
     log.warning("수직 바라인 미감지 — 수평 투영 폴백")
     staff_ys = find_staff_line_ys(gray)
     if not staff_ys:
-        margin = h // 20
-        return [{"y_top": margin, "y_bottom": h - margin}]
+        return []   # 보표 라인 없음 → 악보 없는 페이지(표지 등)로 간주, 빈 목록 반환
 
-    return [{"y_top": max(0, staff_ys[0] - 30), "y_bottom": min(h, staff_ys[-1] + 30)}]
+    y_top = max(0, staff_ys[0] - 30)
+    y_bot = min(h, staff_ys[-1] + 30)
+
+    # 시스템이 페이지 높이의 80% 이상을 차지하면 타이틀/표지 페이지 오감지일 가능성이 높음
+    # → 이 경우 빈 목록 반환하여 phantom 시스템 생성 방지
+    if (y_bot - y_top) / h > 0.80:
+        log.warning("폴백 시스템이 페이지 80% 이상 — 악보 없는 페이지로 간주, 스킵")
+        return []
+
+    return [{"y_top": y_top, "y_bottom": y_bot}]
 
 
 # ── 3. 마디 시작 번호 ─────────────────────────────────────────────────────────

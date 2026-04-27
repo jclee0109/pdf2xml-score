@@ -76,7 +76,7 @@ def run_sprint1(pdf_path: str | Path, output_dir: str | Path) -> ScoreDocument:
     chords_to_json(doc.raw_chords, output_dir / "pass2a_chords.json")
     doc.status     = PipelineStatus.PASS2A_DONE
 
-    from ..utils.audiveris import is_available as audiveris_available, _run_batch, extract_time_signature
+    from ..utils.audiveris import is_available as audiveris_available, _run_batch, extract_time_signature, extract_key_signature
     from pathlib import Path as _Path
     audiveris_cache = output_dir / ".audiveris_cache"
     if audiveris_available():
@@ -85,12 +85,20 @@ def run_sprint1(pdf_path: str | Path, output_dir: str | Path) -> ScoreDocument:
                                 audiveris_cache)
         if _first_mxl:
             detected_time = extract_time_signature(_first_mxl)
+            detected_key  = extract_key_signature(_first_mxl)
+
+            updated = False
             if detected_time:
-                # Audiveris가 감지한 박자표를 우선 신뢰 — CV보다 정확하고
-                # 조건 없이 적용해야 7/4 등 실제 박자표도 올바르게 반영됨
                 log.info(f"Audiveris 박자표 사용: {detected_time}")
                 for sys in doc.layout.systems:
                     sys.time_signature = detected_time
+                updated = True
+            if detected_key:
+                log.info(f"Audiveris 조표 사용: {detected_key}")
+                for sys in doc.layout.systems:
+                    sys.key = detected_key
+                updated = True
+            if updated:
                 layout_to_json(doc.layout, output_dir / "pass1_layout.json")
 
         doc.raw_notes = run_pass2b_audiveris(
