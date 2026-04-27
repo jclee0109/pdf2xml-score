@@ -494,11 +494,13 @@ def run_pass2b_audiveris(
             f"({len(active_parts)}파트)"
         )
 
+        last_sys = max(systems_on_page, key=lambda s: s.end_measure)
         by_part = extract_notes_page(
             img_path=img_path,
             start_measure=first_sys.start_measure,
             active_part_ids=active_parts,
             cache_dir=cache_dir,
+            end_measure=last_sys.end_measure,
         )
 
         if by_part is None:

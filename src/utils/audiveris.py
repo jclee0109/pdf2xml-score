@@ -74,12 +74,16 @@ def _parse_mxl(
     mxl_path: Path,
     start_measure: int,
     n_parts: int,
+    end_measure: int | None = None,
 ) -> dict[int, list[dict]]:
     """
     Audiveris .mxl → {part_0based_idx: [note_dict]}
 
-    measure 번호는 Audiveris 내부(1-based, 페이지 단위)를 전역 번호로 변환:
-        global_measure = start_measure + (audiveris_measure_num - 1)
+    Audiveris는 첫 마디를 0 또는 1로 시작할 수 있다.
+    첫 마디 번호를 자동 감지해 offset을 계산:
+        global_measure = start_measure + (m_num - first_m_num)
+
+    end_measure: 이 값을 초과하는 마디는 무시 (다음 페이지 범위 침범 방지).
     """
     result: dict[int, list[dict]] = {i: [] for i in range(n_parts)}
 
@@ -98,9 +102,16 @@ def _parse_mxl(
             break
 
         divisions = 1
-        for measure in part.findall("measure"):
+        all_measures = part.findall("measure")
+        # Audiveris가 0-based 또는 1-based로 시작할 수 있으므로 첫 마디번호를 기준으로 offset 결정
+        first_m_num = int(all_measures[0].get("number", "1")) if all_measures else 1
+
+        for measure in all_measures:
             m_num = int(measure.get("number", "1"))
-            global_m = start_measure + (m_num - 1)
+            global_m = start_measure + (m_num - first_m_num)
+            # 시스템 범위 초과 마디는 다음 페이지에 귀속 — 건너뜀
+            if end_measure is not None and global_m > end_measure:
+                continue
             beat_counter = 1.0
 
             for child in measure:
@@ -232,9 +243,12 @@ def extract_notes_page(
     start_measure: int,
     active_part_ids: list[str],
     cache_dir: str | Path,
+    end_measure: int | None = None,
 ) -> dict[str, list[dict]] | None:
     """
     페이지 PNG에서 Audiveris로 음표 추출.
+
+    end_measure: 이 마디 번호를 초과하는 음표는 제외 (다음 페이지와 범위 겹침 방지).
 
     Returns:
         {part_id: [note_dict, ...]}  — active_part_ids 순서로 Audiveris 파트를 매핑
@@ -251,7 +265,7 @@ def extract_notes_page(
     if mxl is None:
         return None
 
-    by_idx = _parse_mxl(mxl, start_measure, len(active_part_ids))
+    by_idx = _parse_mxl(mxl, start_measure, len(active_part_ids), end_measure=end_measure)
     n_notes = sum(len(v) for v in by_idx.values())
     log.debug(f"Audiveris {img_path.name}: {len(by_idx)}파트, {n_notes}음표")
 
