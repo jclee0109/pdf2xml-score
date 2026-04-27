@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Score — PDF to MusicXML</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --blue:        #0066cc;
+    --blue-dark:   #0071e3;
+    --ink:         #1d1d1f;
+    --ink-48:      #7a7a7a;
+    --canvas:      #ffffff;
+    --parchment:   #f5f5f7;
+    --hairline:    #e0e0e0;
+    --black:       #000000;
+  }
+
+  body {
+    font-family: "SF Pro Text", system-ui, -apple-system, sans-serif;
+    background: var(--parchment);
+    color: var(--ink);
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+
+  /* ── Nav ── */
+  nav {
+    background: var(--black);
+    height: 44px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    position: sticky;
+    top: 0;
+    z-index: 100;
+  }
+  nav span {
+    font-family: "SF Pro Display", system-ui, -apple-system, sans-serif;
+    font-size: 17px;
+    font-weight: 600;
+    color: #fff;
+    letter-spacing: -0.374px;
+  }
+
+  /* ── Hero ── */
+  main {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 80px 24px;
+    gap: 48px;
+  }
+
+  .headline {
+    text-align: center;
+  }
+  .headline h1 {
+    font-family: "SF Pro Display", system-ui, -apple-system, sans-serif;
+    font-size: 56px;
+    font-weight: 600;
+    line-height: 1.07;
+    letter-spacing: -0.28px;
+    color: var(--ink);
+  }
+  .headline p {
+    margin-top: 12px;
+    font-size: 21px;
+    font-weight: 400;
+    line-height: 1.19;
+    color: var(--ink-48);
+    letter-spacing: 0.231px;
+  }
+
+  /* ── Upload card ── */
+  .card {
+    background: var(--canvas);
+    border-radius: 18px;
+    width: 100%;
+    max-width: 560px;
+    padding: 48px 40px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 24px;
+  }
+
+  .drop-zone {
+    width: 100%;
+    border: 1.5px dashed var(--hairline);
+    border-radius: 11px;
+    padding: 40px 24px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 12px;
+    cursor: pointer;
+    transition: border-color 0.2s;
+  }
+  .drop-zone:hover,
+  .drop-zone.drag-over { border-color: var(--blue); }
+  .drop-zone svg { color: var(--ink-48); }
+  .drop-zone-label {
+    font-size: 17px;
+    font-weight: 400;
+    color: var(--ink-48);
+    letter-spacing: -0.374px;
+    text-align: center;
+  }
+  .drop-zone-label strong {
+    color: var(--blue);
+    font-weight: 400;
+  }
+  .drop-zone-sub {
+    font-size: 12px;
+    color: var(--ink-48);
+    letter-spacing: -0.12px;
+  }
+
+  input[type="file"] { display: none; }
+
+  /* ── Buttons ── */
+  .btn-primary {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    background: var(--blue);
+    color: #fff;
+    font-size: 17px;
+    font-weight: 400;
+    letter-spacing: -0.374px;
+    border: none;
+    border-radius: 9999px;
+    padding: 11px 22px;
+    cursor: pointer;
+    transition: background 0.15s, transform 0.1s;
+    text-decoration: none;
+  }
+  .btn-primary:hover  { background: var(--blue-dark); }
+  .btn-primary:active { transform: scale(0.95); }
+  .btn-primary:disabled {
+    background: var(--hairline);
+    color: var(--ink-48);
+    cursor: not-allowed;
+    transform: none;
+  }
+
+  /* ── Status ── */
+  .status-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 14px;
+    letter-spacing: -0.224px;
+    color: var(--ink-48);
+    min-height: 20px;
+  }
+
+  .spinner {
+    width: 16px;
+    height: 16px;
+    border: 2px solid var(--hairline);
+    border-top-color: var(--blue);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+    flex-shrink: 0;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .dot-done  { width: 8px; height: 8px; border-radius: 50%; background: #34c759; flex-shrink: 0; }
+  .dot-error { width: 8px; height: 8px; border-radius: 50%; background: #ff3b30; flex-shrink: 0; }
+
+  /* ── Selected file chip ── */
+  .file-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    background: var(--parchment);
+    border: 1px solid var(--hairline);
+    border-radius: 11px;
+    padding: 8px 14px;
+    font-size: 14px;
+    letter-spacing: -0.224px;
+    color: var(--ink);
+    max-width: 100%;
+  }
+  .file-chip span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  /* ── Footer ── */
+  footer {
+    background: var(--parchment);
+    border-top: 1px solid var(--hairline);
+    padding: 32px 24px;
+    text-align: center;
+    font-size: 12px;
+    color: var(--ink-48);
+    letter-spacing: -0.12px;
+  }
+
+  @media (max-width: 640px) {
+    .headline h1 { font-size: 34px; }
+    .headline p  { font-size: 17px; }
+    .card { padding: 32px 24px; }
+  }
+</style>
+</head>
+<body>
+
+<nav><span>Score</span></nav>
+
+<main>
+  <div class="headline">
+    <h1>PDF to MusicXML.</h1>
+    <p>악보를 올리면 바로 변환해드립니다.</p>
+  </div>
+
+  <div class="card">
+    <div class="drop-zone" id="dropZone" onclick="document.getElementById('fileInput').click()">
+      <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1M16 12l-4-4m0 0L8 12m4-4v12"/>
+      </svg>
+      <div class="drop-zone-label">
+        <strong>PDF 파일 선택</strong> 또는 여기에 드래그
+      </div>
+      <div class="drop-zone-sub">PDF만 지원합니다</div>
+    </div>
+
+    <input type="file" id="fileInput" accept=".pdf">
+
+    <div id="fileChip" style="display:none" class="file-chip">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/>
+      </svg>
+      <span id="fileName"></span>
+    </div>
+
+    <button class="btn-primary" id="convertBtn" disabled onclick="startConvert()">
+      변환하기
+    </button>
+
+    <div class="status-row" id="statusRow" style="display:none"></div>
+
+    <a class="btn-primary" id="downloadBtn" style="display:none" href="#" download="output.musicxml">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3"/>
+      </svg>
+      MusicXML 다운로드
+    </a>
+  </div>
+</main>
+
+<footer>© 2026 Score. PDF to MusicXML 변환 도구.</footer>
+
+<script>
+  const dropZone   = document.getElementById('dropZone');
+  const fileInput  = document.getElementById('fileInput');
+  const fileChip   = document.getElementById('fileChip');
+  const fileName   = document.getElementById('fileName');
+  const convertBtn = document.getElementById('convertBtn');
+  const statusRow  = document.getElementById('statusRow');
+  const downloadBtn = document.getElementById('downloadBtn');
+
+  let selectedFile = null;
+  let pollTimer = null;
+
+  // ── File select ──
+  fileInput.addEventListener('change', () => {
+    if (fileInput.files[0]) selectFile(fileInput.files[0]);
+  });
+
+  dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('drag-over'); });
+  dropZone.addEventListener('dragleave', () => dropZone.classList.remove('drag-over'));
+  dropZone.addEventListener('drop', e => {
+    e.preventDefault();
+    dropZone.classList.remove('drag-over');
+    const f = e.dataTransfer.files[0];
+    if (f && f.name.endsWith('.pdf')) selectFile(f);
+  });
+
+  function selectFile(f) {
+    selectedFile = f;
+    fileName.textContent = f.name;
+    fileChip.style.display = 'inline-flex';
+    convertBtn.disabled = false;
+    setStatus('');
+    downloadBtn.style.display = 'none';
+  }
+
+  // ── Convert ──
+  async function startConvert() {
+    if (!selectedFile) return;
+    convertBtn.disabled = true;
+    downloadBtn.style.display = 'none';
+    setStatus('uploading');
+
+    const form = new FormData();
+    form.append('file', selectedFile);
+
+    const res = await fetch('/convert', { method: 'POST', body: form });
+    const { job_id } = await res.json();
+
+    setStatus('processing');
+    pollTimer = setInterval(() => poll(job_id), 3000);
+  }
+
+  async function poll(job_id) {
+    const res  = await fetch(`/status/${job_id}`);
+    const data = await res.json();
+    if (data.status === 'done') {
+      clearInterval(pollTimer);
+      setStatus('done');
+      downloadBtn.href = `/download/${job_id}`;
+      downloadBtn.style.display = 'inline-flex';
+      convertBtn.disabled = false;
+    } else if (data.status === 'error') {
+      clearInterval(pollTimer);
+      setStatus('error', data.error);
+      convertBtn.disabled = false;
+    }
+  }
+
+  function setStatus(state, msg) {
+    statusRow.style.display = state ? 'flex' : 'none';
+    if (state === 'uploading')   statusRow.innerHTML = `<div class="spinner"></div> 업로드 중…`;
+    if (state === 'processing')  statusRow.innerHTML = `<div class="spinner"></div> 변환 중… (수 분 소요될 수 있습니다)`;
+    if (state === 'done')        statusRow.innerHTML = `<div class="dot-done"></div> 변환 완료`;
+    if (state === 'error')       statusRow.innerHTML = `<div class="dot-error"></div> ${msg || '오류가 발생했습니다'}`;
+  }
+</script>
+</body>
+</html>
