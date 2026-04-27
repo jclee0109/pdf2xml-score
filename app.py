@@ -26,9 +26,9 @@ async def index():
 @app.post("/convert")
 async def convert(file: UploadFile = File(...)):
     job_id = str(uuid.uuid4())
-    _JOBS[job_id] = {"status": "processing", "output_path": None, "error": None}
+    pdf_stem = Path(file.filename).stem  # 확장자 제외 파일명
+    _JOBS[job_id] = {"status": "processing", "output_path": None, "error": None, "pdf_stem": pdf_stem}
 
-    # 파일을 임시 경로에 저장
     tmp_dir = Path(tempfile.mkdtemp())
     pdf_path = tmp_dir / file.filename
     pdf_path.write_bytes(await file.read())
@@ -50,10 +50,11 @@ async def download(job_id: str):
     job = _JOBS.get(job_id)
     if not job or job["status"] != "done" or not job["output_path"]:
         return {"error": "not ready"}
+    pdf_stem = job.get("pdf_stem", "output")
     return FileResponse(
         job["output_path"],
         media_type="application/xml",
-        filename="output.musicxml",
+        filename=f"{pdf_stem}.musicxml",
     )
 
 
