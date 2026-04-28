@@ -456,16 +456,18 @@ def _extract_parts_individually(
     end_measure: int,
     cache_dir: Path,
     strip_size: int = 7,
+    max_workers: int = 3,
 ) -> dict[str, list[dict]]:
     """
     전체 페이지 Audiveris 실패 시 N파트씩 strip으로 crop + 업스케일해 처리.
 
-    파트별(1개씩) 처리는 21파트×8페이지 = 168회 호출이 필요해 비현실적.
-    N파트씩 묶으면 호출 횟수가 1/N으로 줄면서 interline 문제도 해결됨:
-      7파트 strip: 24회 호출, interline 18px (Audiveris 최소 ~15px 초과)
+    N파트 strip을 ThreadPoolExecutor로 병렬 실행:
+    - Audiveris는 subprocess이므로 GIL 무관, Thread 기반으로 충분
+    - max_workers=3: 동시 Audiveris 프로세스 수 제한 (메모리 ~1.5GB)
 
-    strip_size: 한 번에 처리할 파트 수. 이미지 크기와 interline을 고려해 7 기본.
+    strip 실패 시 (악기 패밀리 경계 가로지름) → 개별 파트도 병렬 재시도
     """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     from ..utils.audiveris import _run_batch, _parse_mxl
     from ..utils.render import load_image, crop_part_range
     from PIL import Image as _Image
@@ -477,66 +479,91 @@ def _extract_parts_individually(
     n_parts = len(active_parts)
     result: dict[str, list[dict]] = {}
 
-    # N파트씩 strips로 분할
     strip_starts = list(range(0, n_parts, strip_size))
-    log.info(f"  → strip 모드: {n_parts}파트 / {strip_size} = {len(strip_starts)}개 strip")
+    log.info(f"  → strip 모드: {n_parts}파트 / {strip_size} = {len(strip_starts)}개 strip (병렬 {max_workers})")
 
+    # ── strip crop 이미지 미리 생성 (IO는 직렬로) ────────────────────────────
+    strip_infos: list[tuple[int, int, list[str], Path]] = []
     for s_start in strip_starts:
         s_end = min(s_start + strip_size - 1, n_parts - 1)
-        n_strip_parts = s_end - s_start + 1
         strip_pids = active_parts[s_start:s_end + 1]
         strip_stem = f"strip_p{system.page}_{s_start}_{s_end}"
+        crop_path = cache_dir / f"{strip_stem}.png"
 
-        if not (cache_dir / f"{strip_stem}.mxl").exists():
+        if not (cache_dir / f"{strip_stem}.mxl").exists() and \
+           not (cache_dir / f"{strip_stem}.failed").exists() and \
+           not crop_path.exists():
             crop = crop_part_range(
-                page_img,
-                system.y_top_px, system.y_bottom_px,
+                page_img, system.y_top_px, system.y_bottom_px,
                 s_start, s_end, n_parts,
             )
             w, h = crop.size
-            pixels = w * h
-            if pixels == 0:
+            if w * h == 0:
                 continue
-            scale = min(3.0, (_AUDIVERIS_MAX_PX / pixels) ** 0.5)
+            scale = min(3.0, (_AUDIVERIS_MAX_PX / (w * h)) ** 0.5)
             if scale > 1.05:
                 crop = crop.resize((int(w * scale), int(h * scale)), _Image.LANCZOS)
-
-            crop_path = cache_dir / f"{strip_stem}.png"
             crop.save(crop_path)
-        else:
-            crop_path = cache_dir / f"{strip_stem}.png"
 
-        mxl = _run_batch(crop_path, cache_dir, timeout=120)
-        if mxl is None:
-            # strip 실패 → 패밀리 경계 가로지름 가능성. 파트 1개씩 재시도
-            log.info(f"  strip {s_start}~{s_end} 실패 → 개별 파트 재시도")
+        strip_infos.append((s_start, s_end, strip_pids, crop_path))
+
+    # ── strip 병렬 실행 ───────────────────────────────────────────────────────
+    failed_strips: list[tuple[int, int, list[str]]] = []
+
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        future_map = {
+            ex.submit(_run_batch, crop_path, cache_dir, 120): (s_start, s_end, strip_pids)
+            for s_start, s_end, strip_pids, crop_path in strip_infos
+        }
+        for future in as_completed(future_map):
+            s_start, s_end, strip_pids = future_map[future]
+            n_strip_parts = s_end - s_start + 1
+            mxl = future.result()
+            if mxl is None:
+                log.info(f"  strip {s_start}~{s_end} 실패 → 개별 파트 재시도")
+                failed_strips.append((s_start, s_end, strip_pids))
+            else:
+                strip_notes = _parse_mxl(mxl, start_measure, n_strip_parts, end_measure=end_measure)
+                for local_idx, pid in enumerate(strip_pids):
+                    result[pid] = strip_notes.get(local_idx, [])
+
+    # ── 실패 strip → 개별 파트 병렬 재시도 ──────────────────────────────────
+    if failed_strips:
+        # 개별 파트 crop 이미지 준비
+        part_tasks: list[tuple[str, Path]] = []
+        for s_start, s_end, strip_pids in failed_strips:
             for i, pid in enumerate(strip_pids):
                 part_stem = f"part_{pid}_p{system.page}"
-                p_crop = crop_part_range(
-                    page_img,
-                    system.y_top_px, system.y_bottom_px,
-                    s_start + i, s_start + i, n_parts,
-                )
-                pw, ph = p_crop.size
-                if pw * ph == 0:
-                    continue
-                p_scale = min(5.0, (_AUDIVERIS_MAX_PX / (pw * ph)) ** 0.5)
-                if p_scale > 1.05:
-                    p_crop = p_crop.resize(
-                        (int(pw * p_scale), int(ph * p_scale)), _Image.LANCZOS
-                    )
                 p_path = cache_dir / f"{part_stem}.png"
-                if not p_path.exists():
+                if not (cache_dir / f"{part_stem}.mxl").exists() and \
+                   not (cache_dir / f"{part_stem}.failed").exists() and \
+                   not p_path.exists():
+                    p_crop = crop_part_range(
+                        page_img, system.y_top_px, system.y_bottom_px,
+                        s_start + i, s_start + i, n_parts,
+                    )
+                    pw, ph = p_crop.size
+                    if pw * ph == 0:
+                        continue
+                    p_scale = min(5.0, (_AUDIVERIS_MAX_PX / (pw * ph)) ** 0.5)
+                    if p_scale > 1.05:
+                        p_crop = p_crop.resize(
+                            (int(pw * p_scale), int(ph * p_scale)), _Image.LANCZOS
+                        )
                     p_crop.save(p_path)
-                p_mxl = _run_batch(p_path, cache_dir, timeout=90)
+                part_tasks.append((pid, p_path))
+
+        with ThreadPoolExecutor(max_workers=max_workers + 1) as ex:
+            future_map = {
+                ex.submit(_run_batch, p_path, cache_dir, 90): pid
+                for pid, p_path in part_tasks
+            }
+            for future in as_completed(future_map):
+                pid = future_map[future]
+                p_mxl = future.result()
                 if p_mxl:
                     part_notes = _parse_mxl(p_mxl, start_measure, 1, end_measure=end_measure)
                     result[pid] = part_notes.get(0, [])
-            continue
-
-        strip_notes = _parse_mxl(mxl, start_measure, n_strip_parts, end_measure=end_measure)
-        for local_idx, pid in enumerate(strip_pids):
-            result[pid] = strip_notes.get(local_idx, [])
 
     n_total = sum(len(v) for v in result.values())
     log.info(f"  → strip 완료: {len(result)}/{n_parts}파트, {n_total}개 음표")

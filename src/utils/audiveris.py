@@ -35,12 +35,21 @@ def _classpath() -> str:
 
 
 def _run_batch(img_path: Path, out_dir: Path, timeout: int = 180) -> Path | None:
-    """Audiveris -batch 실행. 결과 .mxl 경로 반환, 실패 시 None."""
+    """Audiveris -batch 실행. 결과 .mxl 경로 반환, 실패 시 None.
+
+    성공: {stem}.mxl 캐시
+    실패: {stem}.failed 마커 파일 → 다음 실행에서 즉시 skip
+    """
     stem = img_path.stem
     mxl_dst = out_dir / f"{stem}.mxl"
+    failed_marker = out_dir / f"{stem}.failed"
+
     if mxl_dst.exists():
         log.debug(f"Audiveris cache hit: {mxl_dst.name}")
         return mxl_dst
+    if failed_marker.exists():
+        log.debug(f"Audiveris 이전 실패 skip: {img_path.name}")
+        return None
 
     out_dir.mkdir(parents=True, exist_ok=True)
     cmd = [
@@ -75,6 +84,7 @@ def _run_batch(img_path: Path, out_dir: Path, timeout: int = 180) -> Path | None
             except Exception:
                 pass
         log.warning(f"Audiveris: .mxl 결과 없음 ({img_path.name}){reason}")
+        failed_marker.touch()  # 실패 기록 — 다음 실행 시 즉시 skip
         return None
 
     latest = candidates[-1]
