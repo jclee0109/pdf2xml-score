@@ -63,8 +63,8 @@ def run_sprint1(pdf_path: str | Path, output_dir: str | Path) -> ScoreDocument:
         status=PipelineStatus.RENDERING,
     )
 
-    log.info(f"Rendering {pdf_path.name} @ 300dpi")
-    page_paths  = render_pdf(pdf_path, output_dir / "pages", dpi=300)
+    log.info(f"Rendering {pdf_path.name} @ 540dpi")
+    page_paths  = render_pdf(pdf_path, output_dir / "pages", dpi=540)
     doc.pages   = len(page_paths)
     page_images = [load_image(p) for p in page_paths]
 

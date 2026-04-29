@@ -600,7 +600,6 @@ def run_pass2b_audiveris(
 
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
-    _MAX_PX = 18_000_000
 
     # 페이지별 메타 수집
     page_to_systems: dict[int, list[SystemInfo]] = {}
@@ -689,12 +688,8 @@ def run_pass2b_audiveris(
                         first_sys.y_top_px, first_sys.y_bottom_px,
                         s_start, s_end, n_parts,
                     )
-                    w, h = crop.size
-                    if w * h == 0:
+                    if crop.size[0] * crop.size[1] == 0:
                         continue
-                    scale = min(3.0, (_MAX_PX / (w * h)) ** 0.5)
-                    if scale > 1.05:
-                        crop = crop.resize((int(w * scale), int(h * scale)), _Image.LANCZOS)
                     crop.save(crop_path)
 
                 all_strip_infos.append((page_num, s_start, s_end, strip_pids, crop_path))
@@ -754,14 +749,8 @@ def run_pass2b_audiveris(
                         first_sys.y_top_px, first_sys.y_bottom_px,
                         actual_idx, actual_idx, n_parts,
                     )
-                    pw, ph = p_crop.size
-                    if pw * ph == 0:
+                    if p_crop.size[0] * p_crop.size[1] == 0:
                         continue
-                    p_scale = min(5.0, (_MAX_PX / (pw * ph)) ** 0.5)
-                    if p_scale > 1.05:
-                        p_crop = p_crop.resize(
-                            (int(pw * p_scale), int(ph * p_scale)), _Image.LANCZOS
-                        )
                     p_crop.save(p_path)
 
                 failed_parts.append((page_num, pid, actual_idx, p_path))
