@@ -576,18 +576,23 @@ def run_pass2b_audiveris(
     page_img_paths: list[str],
     layout: ScoreLayout,
     cache_dir: str | Path = "output/.audiveris_cache",
+    strip_size: int = 7,
+    max_workers: int = 6,
 ) -> list[RawNote]:
-    """Audiveris로 전체 음표 추출.
+    """Audiveris로 전체 음표 추출 (3-phase 전역 병렬).
 
-    페이지 단위로 Audiveris를 실행하고, 파트 위치(인덱스)로 ScoreLayout에 매핑.
-    Piano 파트가 있어도 Audiveris로 통합 처리 (오케스트라 + 피아노 혼합 악보 지원).
+    Phase 1: 전체 페이지 병렬 처리 (캐시 hit 시 즉시 완료)
+    Phase 2: 실패 페이지의 모든 strip을 단일 ThreadPoolExecutor로 병렬 처리
+    Phase 3: 실패 strip의 개별 파트를 병렬 처리
 
-    Args:
-        page_img_paths: 이미 저장된 페이지 PNG 경로 목록 (page-01.png, ...)
-        layout: ScoreLayout
-        cache_dir: Audiveris 결과 캐시 디렉토리
+    page_img_paths: 저장된 페이지 PNG 경로 목록 (page-01.png, ...)
     """
-    from ..utils.audiveris import extract_notes_page, is_available
+    from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed
+    from ..utils.audiveris import (
+        _run_batch, _parse_mxl, extract_notes_page, is_available,
+    )
+    from ..utils.render import load_image, crop_part_range
+    from PIL import Image as _Image
 
     if not is_available():
         log.error("Audiveris 미설치 — /Applications/Audiveris.app 필요")
@@ -595,60 +600,210 @@ def run_pass2b_audiveris(
 
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
+    _MAX_PX = 18_000_000
 
-    # 페이지별 시스템 그루핑 (1-based page number)
+    # 페이지별 메타 수집
     page_to_systems: dict[int, list[SystemInfo]] = {}
     for s in layout.systems:
         page_to_systems.setdefault(s.page, []).append(s)
 
-    all_raw: list[RawNote] = []
-    processed_pages: set[int] = set()
-
+    page_meta: dict[int, dict] = {}
     for page_num in sorted(page_to_systems):
-        systems_on_page = page_to_systems[page_num]
-        img_path = page_img_paths[page_num - 1]
+        systems = page_to_systems[page_num]
+        first_sys = min(systems, key=lambda s: s.start_measure)
+        last_sys  = max(systems, key=lambda s: s.end_measure)
+        page_meta[page_num] = {
+            "img_path":    page_img_paths[page_num - 1],
+            "first_sys":   first_sys,
+            "last_sys":    last_sys,
+            "active_parts": first_sys.active_parts,
+        }
 
-        # 페이지 첫 시스템 기준으로 start_measure 결정
-        first_sys = min(systems_on_page, key=lambda s: s.start_measure)
-        active_parts = first_sys.active_parts
+    # ── Phase 1: 전체 페이지 병렬 ─────────────────────────────────────────────
+    log.info(f"Pass 2b [Audiveris] Phase 1: {len(page_meta)}페이지 전체 처리")
+    page_by_part: dict[int, dict | None] = {}
 
-        log.info(
-            f"Pass 2b [Audiveris]: p{page_num} "
-            f"m{first_sys.start_measure}~{systems_on_page[-1].end_measure} "
-            f"({len(active_parts)}파트)"
-        )
+    with ThreadPoolExecutor(max_workers=len(page_meta)) as ex:
+        future_map = {
+            ex.submit(
+                extract_notes_page,
+                meta["img_path"],
+                meta["first_sys"].start_measure,
+                meta["active_parts"],
+                cache_dir,
+                meta["last_sys"].end_measure,
+            ): page_num
+            for page_num, meta in page_meta.items()
+        }
+        for future in _as_completed(future_map):
+            page_num = future_map[future]
+            meta = page_meta[page_num]
+            result = future.result()
+            page_by_part[page_num] = result
+            if result is not None:
+                n = sum(len(v) for v in result.values())
+                log.info(
+                    f"  p{page_num} m{meta['first_sys'].start_measure}~"
+                    f"{meta['last_sys'].end_measure} 전체 성공: {n}음표"
+                )
+            else:
+                log.info(
+                    f"  p{page_num} m{meta['first_sys'].start_measure}~"
+                    f"{meta['last_sys'].end_measure} 실패 → strip 예정"
+                )
 
-        last_sys = max(systems_on_page, key=lambda s: s.end_measure)
-        by_part = extract_notes_page(
-            img_path=img_path,
-            start_measure=first_sys.start_measure,
-            active_part_ids=active_parts,
-            cache_dir=cache_dir,
-            end_measure=last_sys.end_measure,
-        )
+    # ── Phase 2: 실패 페이지 전체 strip 병렬 ──────────────────────────────────
+    failed_pages = [p for p in sorted(page_meta) if page_by_part[p] is None]
 
-        if by_part is None:
-            # 전체 페이지 실패 → 파트별 개별 crop + 업스케일 fallback
-            log.info(f"  → 전체 페이지 실패, 파트별 개별 처리 시도: p{page_num}")
-            by_part = _extract_parts_individually(
-                img_path=img_path,
-                system=first_sys,
-                layout=layout,
-                start_measure=first_sys.start_measure,
-                end_measure=last_sys.end_measure,
-                cache_dir=cache_dir,
-            )
-            if not by_part:
-                log.warning(f"  → 개별 처리도 실패: p{page_num}")
+    if failed_pages:
+        log.info(f"Pass 2b [Audiveris] Phase 2: {len(failed_pages)}페이지 strip 병렬")
+
+        # 페이지 이미지 캐시 (이미지당 한 번만 로드)
+        _img_cache: dict[int, _Image.Image] = {}
+
+        def _page_img(pnum: int) -> _Image.Image:
+            if pnum not in _img_cache:
+                _img_cache[pnum] = load_image(page_meta[pnum]["img_path"])
+            return _img_cache[pnum]
+
+        # 모든 실패 페이지의 strip crop 이미지 미리 생성
+        all_strip_infos: list[tuple[int, int, int, list[str], Path]] = []
+
+        for page_num in failed_pages:
+            meta = page_meta[page_num]
+            first_sys = meta["first_sys"]
+            active_parts = meta["active_parts"]
+            n_parts = len(active_parts)
+
+            for s_start in range(0, n_parts, strip_size):
+                s_end = min(s_start + strip_size - 1, n_parts - 1)
+                strip_pids = active_parts[s_start:s_end + 1]
+                strip_stem = f"strip_p{page_num}_{s_start}_{s_end}"
+                crop_path = cache_dir / f"{strip_stem}.png"
+
+                if not (cache_dir / f"{strip_stem}.mxl").exists() and \
+                   not (cache_dir / f"{strip_stem}.failed").exists() and \
+                   not crop_path.exists():
+                    crop = crop_part_range(
+                        _page_img(page_num),
+                        first_sys.y_top_px, first_sys.y_bottom_px,
+                        s_start, s_end, n_parts,
+                    )
+                    w, h = crop.size
+                    if w * h == 0:
+                        continue
+                    scale = min(3.0, (_MAX_PX / (w * h)) ** 0.5)
+                    if scale > 1.05:
+                        crop = crop.resize((int(w * scale), int(h * scale)), _Image.LANCZOS)
+                    crop.save(crop_path)
+
+                all_strip_infos.append((page_num, s_start, s_end, strip_pids, crop_path))
+
+        log.info(f"  → {len(all_strip_infos)}개 strip, max_workers={max_workers}")
+
+        # 모든 strip 한 pool에서 병렬 실행
+        strip_results: dict[tuple[int, int], tuple[list[str], Path | None]] = {}
+
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            future_map = {
+                ex.submit(_run_batch, crop_path, cache_dir, 120): (page_num, s_start, s_end, strip_pids)
+                for page_num, s_start, s_end, strip_pids, crop_path in all_strip_infos
+            }
+            for future in _as_completed(future_map):
+                page_num, s_start, s_end, strip_pids = future_map[future]
+                mxl = future.result()
+                if mxl is None:
+                    log.info(f"  p{page_num} strip {s_start}~{s_end} 실패 → 개별 파트 재시도")
+                    strip_results[(page_num, s_start)] = (strip_pids, None)
+                else:
+                    meta = page_meta[page_num]
+                    notes_by_idx = _parse_mxl(
+                        mxl,
+                        meta["first_sys"].start_measure,
+                        s_end - s_start + 1,
+                        end_measure=meta["last_sys"].end_measure,
+                    )
+                    if page_by_part[page_num] is None:
+                        page_by_part[page_num] = {}
+                    for local_idx, pid in enumerate(strip_pids):
+                        page_by_part[page_num][pid] = notes_by_idx.get(local_idx, [])
+                    strip_results[(page_num, s_start)] = (strip_pids, mxl)
+
+        # ── Phase 3: 실패 strip → 개별 파트 병렬 ────────────────────────────
+        failed_parts: list[tuple[int, str, int, Path]] = []
+        # (page_num, pid, actual_idx_in_page, crop_path)
+
+        for (page_num, s_start), (strip_pids, mxl) in strip_results.items():
+            if mxl is not None:
                 continue
+            meta = page_meta[page_num]
+            first_sys = meta["first_sys"]
+            active_parts = meta["active_parts"]
+            n_parts = len(active_parts)
 
+            for i, pid in enumerate(strip_pids):
+                actual_idx = s_start + i
+                part_stem = f"part_{pid}_p{page_num}"
+                p_path = cache_dir / f"{part_stem}.png"
+
+                if not (cache_dir / f"{part_stem}.mxl").exists() and \
+                   not (cache_dir / f"{part_stem}.failed").exists() and \
+                   not p_path.exists():
+                    p_crop = crop_part_range(
+                        _page_img(page_num),
+                        first_sys.y_top_px, first_sys.y_bottom_px,
+                        actual_idx, actual_idx, n_parts,
+                    )
+                    pw, ph = p_crop.size
+                    if pw * ph == 0:
+                        continue
+                    p_scale = min(5.0, (_MAX_PX / (pw * ph)) ** 0.5)
+                    if p_scale > 1.05:
+                        p_crop = p_crop.resize(
+                            (int(pw * p_scale), int(ph * p_scale)), _Image.LANCZOS
+                        )
+                    p_crop.save(p_path)
+
+                failed_parts.append((page_num, pid, actual_idx, p_path))
+
+        if failed_parts:
+            log.info(f"Pass 2b [Audiveris] Phase 3: {len(failed_parts)}개 개별 파트 병렬")
+            with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                future_map = {
+                    ex.submit(_run_batch, p_path, cache_dir, 90): (page_num, pid)
+                    for page_num, pid, _, p_path in failed_parts
+                }
+                for future in _as_completed(future_map):
+                    page_num, pid = future_map[future]
+                    p_mxl = future.result()
+                    if p_mxl:
+                        meta = page_meta[page_num]
+                        part_notes = _parse_mxl(
+                            p_mxl,
+                            meta["first_sys"].start_measure,
+                            1,
+                            end_measure=meta["last_sys"].end_measure,
+                        )
+                        if page_by_part[page_num] is None:
+                            page_by_part[page_num] = {}
+                        page_by_part[page_num][pid] = part_notes.get(0, [])
+
+    # ── 결과 취합 ─────────────────────────────────────────────────────────────
+    all_raw: list[RawNote] = []
+    processed_pages = 0
+
+    for page_num in sorted(page_meta):
+        by_part = page_by_part.get(page_num)
+        if not by_part:
+            log.warning(f"  p{page_num}: 음표 없음 (전 단계 실패)")
+            continue
+
+        processed_pages += 1
+        first_sys = page_meta[page_num]["first_sys"]
         n_notes = sum(len(v) for v in by_part.values())
-        log.info(f"  → {n_notes}개 음표")
+        log.info(f"  → p{page_num}: {n_notes}개 음표")
 
         for pid, note_dicts in by_part.items():
-            part_idx = int(pid[1:])
-            part = layout.parts[part_idx]
-            source_sys = first_sys.system_index
             for nd in note_dicts:
                 all_raw.append(RawNote(
                     measure=nd["measure"],
@@ -661,10 +816,8 @@ def run_pass2b_audiveris(
                     voice=nd["voice"],
                     confidence=nd["confidence"],
                     part_id=pid,
-                    source_system=source_sys,
+                    source_system=first_sys.system_index,
                 ))
 
-        processed_pages.add(page_num)
-
-    log.info(f"Pass 2b [Audiveris] 완료: {len(processed_pages)}페이지, 총 {len(all_raw)}개 음표")
+    log.info(f"Pass 2b [Audiveris] 완료: {processed_pages}페이지, 총 {len(all_raw)}개 음표")
     return all_raw
