@@ -93,6 +93,77 @@ def _run_batch(img_path: Path, out_dir: Path, timeout: int = 180) -> Path | None
     return mxl_dst
 
 
+def _run_batch_multi(
+    img_paths: list[Path],
+    out_dir: Path,
+    timeout: int = 300,
+) -> dict[str, Path | None]:
+    """이미지 여러 개를 JVM 한 번에 처리. {stem: mxl_path | None} 반환.
+
+    캐시/실패 마커가 있는 항목은 즉시 skip하고 새 항목만 Audiveris에 넘긴다.
+    """
+    if not img_paths:
+        return {}
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    results: dict[str, Path | None] = {}
+    to_process: list[Path] = []
+
+    for img_path in img_paths:
+        stem = img_path.stem
+        mxl_dst = out_dir / f"{stem}.mxl"
+        failed_marker = out_dir / f"{stem}.failed"
+        if mxl_dst.exists():
+            log.debug(f"Audiveris cache hit: {mxl_dst.name}")
+            results[stem] = mxl_dst
+        elif failed_marker.exists():
+            log.debug(f"Audiveris 이전 실패 skip: {img_path.name}")
+            results[stem] = None
+        else:
+            to_process.append(img_path)
+
+    if not to_process:
+        return results
+
+    cmd = [
+        str(_JAVA),
+        "-Djava.awt.headless=true",
+        "-Dapple.awt.UIElement=true",
+        "-cp", _classpath(), "Audiveris",
+        "-batch", "-export",
+        "-output", str(out_dir),
+    ] + [str(p) for p in to_process]
+
+    try:
+        subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        log.warning(f"Audiveris multi-batch timeout ({timeout}s): {len(to_process)}개 이미지")
+        for p in to_process:
+            results[p.stem] = None
+        return results
+    except Exception as e:
+        log.warning(f"Audiveris multi-batch error: {e}")
+        for p in to_process:
+            results[p.stem] = None
+        return results
+
+    for img_path in to_process:
+        stem = img_path.stem
+        mxl_dst = out_dir / f"{stem}.mxl"
+        candidates = sorted(out_dir.glob(f"{stem}*.mxl"), key=lambda p: p.stat().st_mtime)
+        if not candidates:
+            log.warning(f"Audiveris: .mxl 결과 없음 ({img_path.name})")
+            (out_dir / f"{stem}.failed").touch()
+            results[stem] = None
+        else:
+            latest = candidates[-1]
+            if latest != mxl_dst:
+                latest.rename(mxl_dst)
+            results[stem] = mxl_dst
+
+    return results
+
+
 def _parse_mxl(
     mxl_path: Path,
     start_measure: int,
