@@ -149,7 +149,41 @@
     transform: none;
   }
 
-  /* ── Status ── */
+  /* ── Progress bar ── */
+  .progress-wrap {
+    width: 100%;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .progress-track {
+    width: 100%;
+    height: 4px;
+    background: var(--hairline);
+    border-radius: 2px;
+    overflow: hidden;
+  }
+  .progress-fill {
+    height: 100%;
+    background: var(--blue);
+    border-radius: 2px;
+    width: 0%;
+    transition: width 0.5s ease;
+  }
+  .progress-meta {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 13px;
+    letter-spacing: -0.2px;
+    color: var(--ink-48);
+  }
+  .progress-pct {
+    font-variant-numeric: tabular-nums;
+    flex-shrink: 0;
+  }
+
+  /* ── Status row (error / done) ── */
   .status-row {
     display: flex;
     align-items: center;
@@ -159,17 +193,6 @@
     color: var(--ink-48);
     min-height: 20px;
   }
-
-  .spinner {
-    width: 16px;
-    height: 16px;
-    border: 2px solid var(--hairline);
-    border-top-color: var(--blue);
-    border-radius: 50%;
-    animation: spin 0.8s linear infinite;
-    flex-shrink: 0;
-  }
-  @keyframes spin { to { transform: rotate(360deg); } }
 
   .dot-done  { width: 8px; height: 8px; border-radius: 50%; background: #34c759; flex-shrink: 0; }
   .dot-error { width: 8px; height: 8px; border-radius: 50%; background: #ff3b30; flex-shrink: 0; }
@@ -246,37 +269,96 @@
       변환하기
     </button>
 
+    <div class="progress-wrap" id="progressWrap" style="display:none">
+      <div class="progress-track">
+        <div class="progress-fill" id="progressFill"></div>
+      </div>
+      <div class="progress-meta">
+        <span id="progressStep">처리 중...</span>
+        <span class="progress-pct" id="progressPct">0%</span>
+      </div>
+    </div>
+
     <div class="status-row" id="statusRow" style="display:none"></div>
 
-    <a class="btn-primary" id="downloadBtn" style="display:none" href="#" download="output.musicxml">
+    <button class="btn-primary" id="downloadBtn" style="display:none" onclick="doDownload()">
       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
         <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3"/>
       </svg>
       MusicXML 다운로드
-    </a>
+    </button>
   </div>
 </main>
 
 <footer>© 2026 Score. PDF to MusicXML 변환 도구.</footer>
 
 <script>
-  const dropZone   = document.getElementById('dropZone');
-  const fileInput  = document.getElementById('fileInput');
-  const fileChip   = document.getElementById('fileChip');
-  const fileName   = document.getElementById('fileName');
-  const convertBtn = document.getElementById('convertBtn');
-  const statusRow  = document.getElementById('statusRow');
+  const dropZone    = document.getElementById('dropZone');
+  const fileInput   = document.getElementById('fileInput');
+  const fileChip    = document.getElementById('fileChip');
+  const fileName    = document.getElementById('fileName');
+  const convertBtn  = document.getElementById('convertBtn');
+  const statusRow   = document.getElementById('statusRow');
   const downloadBtn = document.getElementById('downloadBtn');
+  const progressWrap = document.getElementById('progressWrap');
+  const progressFill = document.getElementById('progressFill');
+  const progressStep = document.getElementById('progressStep');
+  const progressPct  = document.getElementById('progressPct');
 
+  const STEP_LABELS = {
+    uploading: '업로드 중',
+    rendering: 'PDF 렌더링 중',
+    pass1:     '레이아웃 분석 중',
+    pass2a:    '코드 추출 중',
+    pass2b:    '음표 인식 중',
+    pass2c:    '가사 추출 중',
+    building:  'MusicXML 생성 중',
+    done:      '변환 완료',
+  };
+
+  // progress bar state
+  let reportedPct  = 0;
+  let displayPct   = 0;
+  let animTimer    = null;
+  let pollTimer    = null;
   let selectedFile = null;
-  let pollTimer = null;
+  let currentJobId = null;
+
+  function startAnim() {
+    if (animTimer) return;
+    animTimer = setInterval(() => {
+      if (displayPct < reportedPct) {
+        displayPct = Math.min(displayPct + 3, reportedPct);
+      } else if (displayPct < reportedPct + 18 && displayPct < 91) {
+        // slowly drift ahead during long steps (pass2b)
+        displayPct = Math.min(displayPct + 0.25, reportedPct + 18, 91);
+      }
+      renderBar(displayPct);
+    }, 500);
+  }
+
+  function stopAnim() {
+    clearInterval(animTimer);
+    animTimer = null;
+  }
+
+  function renderBar(pct) {
+    progressFill.style.width = pct + '%';
+    progressPct.textContent  = Math.round(pct) + '%';
+  }
+
+  function setProgress(step, pct) {
+    reportedPct = pct;
+    progressStep.textContent = STEP_LABELS[step] || step;
+    progressWrap.style.display = 'flex';
+    statusRow.style.display    = 'none';
+  }
 
   // ── File select ──
   fileInput.addEventListener('change', () => {
     if (fileInput.files[0]) selectFile(fileInput.files[0]);
   });
-
-  dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('drag-over'); });
+  dropZone.addEventListener('dragover',  e => { e.preventDefault(); dropZone.classList.add('drag-over'); });
   dropZone.addEventListener('dragleave', () => dropZone.classList.remove('drag-over'));
   dropZone.addEventListener('drop', e => {
     e.preventDefault();
@@ -290,8 +372,9 @@
     fileName.textContent = f.name;
     fileChip.style.display = 'inline-flex';
     convertBtn.disabled = false;
-    setStatus('');
-    downloadBtn.style.display = 'none';
+    progressWrap.style.display = 'none';
+    statusRow.style.display    = 'none';
+    downloadBtn.style.display  = 'none';
   }
 
   // ── Convert ──
@@ -299,40 +382,74 @@
     if (!selectedFile) return;
     convertBtn.disabled = true;
     downloadBtn.style.display = 'none';
-    setStatus('uploading');
+
+    displayPct = 0; reportedPct = 0;
+    renderBar(0);
+    setProgress('uploading', 2);
+    startAnim();
 
     const form = new FormData();
     form.append('file', selectedFile);
-
-    const res = await fetch('/convert', { method: 'POST', body: form });
+    const res    = await fetch('/convert', { method: 'POST', body: form });
     const { job_id } = await res.json();
 
-    setStatus('processing');
-    pollTimer = setInterval(() => poll(job_id), 3000);
+    currentJobId = job_id;
+    pollTimer = setInterval(() => poll(job_id), 1500);
+  }
+
+  async function doDownload() {
+    if (!currentJobId) return;
+    try {
+      const res = await fetch(`/download/${currentJobId}`);
+      if (!res.ok) {
+        statusRow.style.display = 'flex';
+        statusRow.innerHTML = `<div class="dot-error"></div> 다운로드 실패 — 서버가 재시작됐을 수 있습니다. 다시 변환해주세요.`;
+        downloadBtn.style.display = 'none';
+        return;
+      }
+      const blob = await res.blob();
+      const cd = res.headers.get('content-disposition') || '';
+      const match = cd.match(/filename="?([^";\r\n]+)"?/);
+      const fname = match ? match[1] : 'output.musicxml';
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = fname;
+      document.body.appendChild(a); a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      statusRow.style.display = 'flex';
+      statusRow.innerHTML = `<div class="dot-error"></div> 다운로드 오류: ${err.message}`;
+    }
   }
 
   async function poll(job_id) {
     const res  = await fetch(`/status/${job_id}`);
     const data = await res.json();
+
     if (data.status === 'done') {
       clearInterval(pollTimer);
-      setStatus('done');
-      downloadBtn.href = `/download/${job_id}`;
-      downloadBtn.style.display = 'inline-flex';
-      convertBtn.disabled = false;
+      stopAnim();
+      reportedPct = 100; displayPct = 100;
+      renderBar(100);
+      progressStep.textContent = STEP_LABELS.done;
+      setTimeout(() => {
+        progressWrap.style.display = 'none';
+        statusRow.style.display = 'flex';
+        statusRow.innerHTML = `<div class="dot-done"></div> 변환 완료`;
+        downloadBtn.style.display = 'inline-flex';
+        convertBtn.disabled = false;
+      }, 400);
     } else if (data.status === 'error') {
       clearInterval(pollTimer);
-      setStatus('error', data.error);
+      stopAnim();
+      progressWrap.style.display = 'none';
+      statusRow.style.display = 'flex';
+      statusRow.innerHTML = `<div class="dot-error"></div> ${data.error || '오류가 발생했습니다'}`;
       convertBtn.disabled = false;
+    } else if (data.step) {
+      setProgress(data.step, data.progress);
     }
-  }
-
-  function setStatus(state, msg) {
-    statusRow.style.display = state ? 'flex' : 'none';
-    if (state === 'uploading')   statusRow.innerHTML = `<div class="spinner"></div> 업로드 중…`;
-    if (state === 'processing')  statusRow.innerHTML = `<div class="spinner"></div> 변환 중… (수 분 소요될 수 있습니다)`;
-    if (state === 'done')        statusRow.innerHTML = `<div class="dot-done"></div> 변환 완료`;
-    if (state === 'error')       statusRow.innerHTML = `<div class="dot-error"></div> ${msg || '오류가 발생했습니다'}`;
   }
 </script>
 </body>
