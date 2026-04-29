@@ -106,6 +106,33 @@ def run_sprint1(pdf_path: str | Path, output_dir: str | Path) -> ScoreDocument:
             doc.layout,
             cache_dir=audiveris_cache,
         )
+
+        # 전체 페이지 Audiveris 실패 시 strip MXL에서 박자표/조표 재시도
+        if _first_mxl is None:
+            _strip_time: str | None = None
+            _strip_key:  str | None = None
+            for _mxl in sorted(audiveris_cache.glob("*.mxl")):
+                if _strip_time is None:
+                    _strip_time = extract_time_signature(_mxl)
+                if _strip_key is None:
+                    _strip_key = extract_key_signature(_mxl)
+                if _strip_time and _strip_key:
+                    break
+
+            _updated = False
+            if _strip_time:
+                log.info(f"strip MXL 박자표 사용: {_strip_time}")
+                for sys in doc.layout.systems:
+                    sys.time_signature = _strip_time
+                _updated = True
+            if _strip_key:
+                log.info(f"strip MXL 조표 사용: {_strip_key}")
+                for sys in doc.layout.systems:
+                    sys.key = _strip_key
+                _updated = True
+            if _updated:
+                layout_to_json(doc.layout, output_dir / "pass1_layout.json")
+
     else:
         doc.raw_notes = run_pass2b(page_images, doc.layout)
     notes_to_json(doc.raw_notes, output_dir / "pass2b_notes.json")
