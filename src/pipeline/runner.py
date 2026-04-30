@@ -51,10 +51,14 @@ def validate_musicxml(xml_bytes: bytes) -> list[str]:
     return errors
 
 
-def run_sprint1(pdf_path: str | Path, output_dir: str | Path) -> ScoreDocument:
+def run_sprint1(pdf_path: str | Path, output_dir: str | Path, _progress=None) -> ScoreDocument:
     """API 호출 모드 — ANTHROPIC_API_KEY 필요."""
     pdf_path   = Path(pdf_path)
     output_dir = Path(output_dir)
+
+    def _p(step: str, pct: int):
+        if _progress:
+            _progress(step, pct)
 
     doc = ScoreDocument(
         id=pdf_path.stem,
@@ -63,15 +67,18 @@ def run_sprint1(pdf_path: str | Path, output_dir: str | Path) -> ScoreDocument:
         status=PipelineStatus.RENDERING,
     )
 
+    _p("rendering", 5)
     log.info(f"Rendering {pdf_path.name} @ 540dpi")
     page_paths  = render_pdf(pdf_path, output_dir / "pages", dpi=540)
     doc.pages   = len(page_paths)
     page_images = [load_image(p) for p in page_paths]
 
+    _p("pass1", 18)
     doc.layout = run_pass1(page_images)
     layout_to_json(doc.layout, output_dir / "pass1_layout.json")
     doc.status = PipelineStatus.PASS1_DONE
 
+    _p("pass2a", 32)
     doc.raw_chords = run_pass2a(page_images, doc.layout)
     chords_to_json(doc.raw_chords, output_dir / "pass2a_chords.json")
     doc.status     = PipelineStatus.PASS2A_DONE
@@ -79,6 +86,7 @@ def run_sprint1(pdf_path: str | Path, output_dir: str | Path) -> ScoreDocument:
     from ..utils.audiveris import is_available as audiveris_available, _run_batch, extract_time_signature, extract_key_signature
     from pathlib import Path as _Path
     audiveris_cache = output_dir / ".audiveris_cache"
+    _p("pass2b", 42)
     if audiveris_available():
         # Audiveris로 박자표 보정 — CV 감지보다 정확
         _first_mxl = _run_batch(_Path(page_paths[1]) if len(page_paths) > 1 else _Path(page_paths[0]),
@@ -138,11 +146,12 @@ def run_sprint1(pdf_path: str | Path, output_dir: str | Path) -> ScoreDocument:
     notes_to_json(doc.raw_notes, output_dir / "pass2b_notes.json")
     doc.status    = PipelineStatus.PASS2B_DONE
 
+    _p("pass2c", 82)
     doc.raw_lyrics = run_pass2c(page_images, doc.layout)
     lyrics_to_json(doc.raw_lyrics, output_dir / "pass2c_lyrics.json")
     doc.status     = PipelineStatus.PASS2C_DONE
 
-    return _finish(doc, output_dir)
+    return _finish(doc, output_dir, _progress=_progress)
 
 
 def run_sprint1_from_files(output_dir: str | Path) -> ScoreDocument:
@@ -195,8 +204,10 @@ def run_sprint1_from_files(output_dir: str | Path) -> ScoreDocument:
     return _finish(doc, output_dir)
 
 
-def _finish(doc: ScoreDocument, output_dir: Path) -> ScoreDocument:
+def _finish(doc: ScoreDocument, output_dir: Path, _progress=None) -> ScoreDocument:
     """Pass 3 → Build → 검증 → 저장 공통 경로."""
+    if _progress:
+        _progress("building", 93)
     validated_chords = validate_chords(doc.raw_chords, doc.layout)
     validated_notes  = validate_notes(doc.raw_notes, doc.layout)
 
