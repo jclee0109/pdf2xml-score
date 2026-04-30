@@ -14,6 +14,26 @@ _BASS_KEYWORDS  = {"bass", "bassoon", "trombone", "tuba", "contrabass", "cello",
 _ALTO_KEYWORDS  = {"viola"}
 _TENOR_KEYWORDS = {"tenor"}
 
+# 알려진 악기 키워드 — OCR 결과가 실제 악기명인지 판별할 때 사용
+_KNOWN_INSTRUMENTS = frozenset({
+    "piccolo", "flute", "oboe", "clarinet", "bassoon",
+    "saxophone", "sax",
+    "horn", "trumpet", "trombone", "tuba",
+    "violin", "viola", "cello", "contrabass", "bass",
+    "piano", "organ", "harp", "keyboard",
+    "timpani", "percussion", "drum", "xylophone", "marimba",
+    "guitar", "banjo", "mandolin", "lute",
+    "soprano", "mezzo", "alto", "tenor", "baritone",
+    "voice", "vocal", "choir", "chorus",
+    "strings", "woodwind", "brass",
+})
+
+
+def is_plausible_instrument(name: str) -> bool:
+    """이름에 알려진 악기 키워드가 포함돼 있으면 True."""
+    lower = name.lower()
+    return any(k in lower for k in _KNOWN_INSTRUMENTS)
+
 
 def _infer_clef(name: str) -> str:
     lower = name.lower()

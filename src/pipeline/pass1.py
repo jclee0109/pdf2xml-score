@@ -10,7 +10,7 @@ from ..models.score import (
     RehearsalMark, RepeatBarline, VoltaBracket, KeyChange,
     TRANSPOSITION_TABLE, _transposition_semitones,
 )
-from ..utils.ocr import extract_instrument_names
+from ..utils.ocr import extract_instrument_names, is_plausible_instrument
 from ..utils.staff_detect import analyze_page
 
 log = logging.getLogger(__name__)
@@ -18,8 +18,33 @@ log = logging.getLogger(__name__)
 
 # ── Step 1-A: 악기 목록 (pytesseract OCR) ────────────────────────────────────
 
+def _infer_parts_from_staves(img: Image.Image) -> list[dict]:
+    """악기명 OCR 실패 시 보표 수로 파트 추론. 피아노/리드시트 등 단순 악보용."""
+    from ..utils.staff_detect import _to_gray, count_staves_per_system, detect_staff_systems
+    systems = detect_staff_systems(img)
+    if not systems:
+        log.info("시스템 감지 실패 → 피아노 2단보 기본값")
+        return [{"name": "Piano treble", "clef": "treble"},
+                {"name": "Piano bass",   "clef": "bass"}]
+    gray = _to_gray(img)
+    sys0 = systems[0]
+    n = count_staves_per_system(gray, sys0["y_top"], sys0["y_bottom"])
+    log.info(f"보표 수 감지: {n}개")
+    if n <= 1:
+        return [{"name": "Piano", "clef": "treble"}]
+    elif n == 2:
+        return [{"name": "Piano treble", "clef": "treble"},
+                {"name": "Piano bass",   "clef": "bass"}]
+    else:
+        parts = []
+        for i in range(n):
+            clef = "bass" if i == n - 1 else "treble"
+            parts.append({"name": f"Staff {i+1}", "clef": clef})
+        return parts
+
+
 def extract_parts(page_images: list[Image.Image]) -> list[PartInfo]:
-    """악기 목록 추출. 페이지 1 실패 시 페이지 2-3까지 순서대로 시도."""
+    """악기 목록 추출. OCR 실패 또는 비악기명이면 보표 수 기반 fallback."""
     raw_parts: list[dict] = []
     for img in page_images[:3]:
         raw_parts = extract_instrument_names(img)
@@ -27,8 +52,17 @@ def extract_parts(page_images: list[Image.Image]) -> list[PartInfo]:
             break
         log.debug(f"악기명 OCR 결과 부족({len(raw_parts)}개), 다음 페이지 시도")
 
+    if raw_parts:
+        plausible = [p for p in raw_parts if is_plausible_instrument(p["name"])]
+        if plausible:
+            raw_parts = plausible
+        else:
+            log.info(f"OCR 결과 {[p['name'] for p in raw_parts]} → 악기명 아님, 보표 수 fallback")
+            raw_parts = []
+
     if not raw_parts:
-        raise RuntimeError("Step 1-A: 악기 목록 OCR 실패 — 왼쪽 여백에서 텍스트를 찾지 못했습니다")
+        raw_parts = _infer_parts_from_staves(page_images[0])
+        log.info(f"보표 수 기반 파트: {[p['name'] for p in raw_parts]}")
 
     parts = []
     for i, p in enumerate(raw_parts):

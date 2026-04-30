@@ -229,6 +229,33 @@ def _first_staff_group(staff_ys: list[int], max_line_gap: int = 80) -> list[int]
     return []
 
 
+def count_staves_per_system(gray: np.ndarray, y_top: int, y_bottom: int) -> int:
+    """시스템 y 범위 내 보표(5선 묶음) 수 반환.
+
+    악보 유형 자동 감지용: 2 → 피아노 2단보, 1 → 단선보, n → n파트 앙상블.
+    """
+    region = gray[max(0, y_top):min(gray.shape[0], y_bottom), :]
+    if region.shape[0] < 20:
+        return 1
+    line_ys = find_staff_line_ys(region, threshold=0.35)
+    if len(line_ys) < 5:
+        return 1
+
+    INTRA_GAP = 80  # 같은 보표 내 라인 간 최대 간격(px)
+    groups: list[list[int]] = []
+    current = [line_ys[0]]
+    for y in line_ys[1:]:
+        if y - current[-1] <= INTRA_GAP:
+            current.append(y)
+        else:
+            groups.append(current)
+            current = [y]
+    groups.append(current)
+
+    n = sum(1 for g in groups if len(g) >= 5)
+    return n if n > 0 else 1
+
+
 # ── 4. 보표 x 시작 위치 추정 ──────────────────────────────────────────────────
 
 def _find_staff_x_start(gray: np.ndarray) -> int:
